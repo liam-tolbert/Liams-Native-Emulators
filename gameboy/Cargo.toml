@@ -1,0 +1,10 @@
+[package]
+name = "gameboy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Same pure-Rust window + framebuffer + keyboard crate used by the CHIP-8 project —
+# no SDL or native-linking hassle on Windows. The DMG screen is 160x144; we scale
+# it up in the host shell. (Not wired in until the PPU exists in M4.)
+minifb = "0.27"

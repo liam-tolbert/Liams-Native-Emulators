@@ -1,0 +1,9 @@
+[package]
+name = "chip8"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Tiny, dependency-free window + framebuffer + keyboard input.
+# Perfect for a 1-bit 64x32 display — no SDL/native linking hassle on Windows.
+minifb = "0.27"
