@@ -242,130 +242,329 @@ impl Cpu {
         }
     }
 
+    // ===== ALU primitives ======================================================
+    // Each operates on the accumulator the way the hardware does and sets F to match.
+    // Implementing the flag rules ONCE here (instead of in every opcode arm) is what
+    // keeps Blargg-level correctness tractable — the half-carry rules in particular are
+    // the #1 source of subtle bugs, so they exist in exactly one place per operation.
+
+    fn alu_add(&mut self, val: u8) {
+        let (res, carry) = self.a.overflowing_add(val);
+        self.set_flag(FLAG_Z, res == 0);
+        self.set_flag(FLAG_N, false);
+        self.set_flag(FLAG_H, hc_add(self.a, val));
+        self.set_flag(FLAG_C, carry);
+        self.a = res;
+    }
+    // ADC folds the incoming carry into BOTH the result and the half/full-carry tests,
+    // so it can't reuse overflowing_add (that would miss the +1 spilling a nibble/byte).
+    fn alu_adc(&mut self, val: u8) {
+        let carry = self.flag(FLAG_C) as u8;
+        let res = self.a.wrapping_add(val).wrapping_add(carry);
+        self.set_flag(FLAG_Z, res == 0);
+        self.set_flag(FLAG_N, false);
+        self.set_flag(FLAG_H, (self.a & 0x0F) + (val & 0x0F) + carry > 0x0F);
+        self.set_flag(FLAG_C, self.a as u16 + val as u16 + carry as u16 > 0xFF);
+        self.a = res;
+    }
+    fn alu_sub(&mut self, val: u8) {
+        let (res, borrow) = self.a.overflowing_sub(val);
+        self.set_flag(FLAG_Z, res == 0);
+        self.set_flag(FLAG_N, true);
+        self.set_flag(FLAG_H, hc_sub(self.a, val)); // half-BORROW, not hc_add
+        self.set_flag(FLAG_C, borrow); // overflowing_sub's overflow flag == borrow
+        self.a = res;
+    }
+    fn alu_sbc(&mut self, val: u8) {
+        let carry = self.flag(FLAG_C) as u8;
+        let res = self.a.wrapping_sub(val).wrapping_sub(carry);
+        self.set_flag(FLAG_Z, res == 0);
+        self.set_flag(FLAG_N, true);
+        self.set_flag(FLAG_H, (self.a & 0x0F) < (val & 0x0F) + carry);
+        self.set_flag(FLAG_C, (self.a as u16) < val as u16 + carry as u16);
+        self.a = res;
+    }
+    // Logical ops always clear C and N. The H asymmetry is a classic Blargg catch:
+    // AND sets H=1, while OR and XOR set H=0.
+    fn alu_and(&mut self, val: u8) {
+        self.a &= val;
+        self.set_flag(FLAG_Z, self.a == 0);
+        self.set_flag(FLAG_N, false);
+        self.set_flag(FLAG_H, true);
+        self.set_flag(FLAG_C, false);
+    }
+    fn alu_or(&mut self, val: u8) {
+        self.a |= val;
+        self.set_flag(FLAG_Z, self.a == 0);
+        self.set_flag(FLAG_N, false);
+        self.set_flag(FLAG_H, false);
+        self.set_flag(FLAG_C, false);
+    }
+    fn alu_xor(&mut self, val: u8) {
+        self.a ^= val;
+        self.set_flag(FLAG_Z, self.a == 0);
+        self.set_flag(FLAG_N, false);
+        self.set_flag(FLAG_H, false);
+        self.set_flag(FLAG_C, false);
+    }
+    // CP is SUB that throws the result away — it only sets flags (used for comparisons).
+    fn alu_cp(&mut self, val: u8) {
+        let res = self.a.wrapping_sub(val);
+        self.set_flag(FLAG_Z, res == 0);
+        self.set_flag(FLAG_N, true);
+        self.set_flag(FLAG_H, hc_sub(self.a, val));
+        self.set_flag(FLAG_C, self.a < val);
+    }
+    // INC/DEC of an 8-bit value: they set Z/N/H but leave C UNTOUCHED (the one trap that
+    // separates them from ADD/SUB). They return the new value so the caller can store it
+    // back into a register or (HL).
+    fn alu_inc(&mut self, val: u8) -> u8 {
+        let res = val.wrapping_add(1);
+        self.set_flag(FLAG_Z, res == 0);
+        self.set_flag(FLAG_N, false);
+        self.set_flag(FLAG_H, (val & 0x0F) == 0x0F); // nibble was full -> carries
+        res
+    }
+    fn alu_dec(&mut self, val: u8) -> u8 {
+        let res = val.wrapping_sub(1);
+        self.set_flag(FLAG_Z, res == 0);
+        self.set_flag(FLAG_N, true);
+        self.set_flag(FLAG_H, (val & 0x0F) == 0x00); // nibble was empty -> borrows
+        res
+    }
+    // 16-bit ADD HL,rr: N=0, H = carry out of bit 11, C = carry out of bit 15; Z is left
+    // alone (a rare case of an arithmetic op not touching Z).
+    fn add_hl(&mut self, val: u16) {
+        let hl = self.hl();
+        let (res, carry) = hl.overflowing_add(val);
+        self.set_flag(FLAG_N, false);
+        self.set_flag(FLAG_H, (hl & 0x0FFF) + (val & 0x0FFF) > 0x0FFF);
+        self.set_flag(FLAG_C, carry);
+        self.set_hl(res);
+    }
+    // ADD SP,e and LD HL,SP+e share this: the offset is SIGNED for the result, but H and
+    // C are computed from the UNSIGNED low-byte addition, and Z and N are forced to 0.
+    fn add_sp_e(&mut self, e: i8) -> u16 {
+        let sp = self.sp;
+        let off = e as i16 as u16;
+        self.set_flag(FLAG_Z, false);
+        self.set_flag(FLAG_N, false);
+        self.set_flag(FLAG_H, (sp & 0x000F) + (off & 0x000F) > 0x000F);
+        self.set_flag(FLAG_C, (sp & 0x00FF) + (off & 0x00FF) > 0x00FF);
+        sp.wrapping_add(off)
+    }
+    // DAA: after a BCD add or subtract, nudge A back into packed-BCD form using N/H/C.
+    // This is the single fiddliest non-CB op; the form below is the standard one that
+    // passes Blargg. N is left unchanged, H is always cleared.
+    fn daa(&mut self) {
+        let mut a = self.a;
+        let mut adjust: u8 = 0;
+        let mut set_carry = false;
+        if self.flag(FLAG_H) || (!self.flag(FLAG_N) && (a & 0x0F) > 0x09) {
+            adjust |= 0x06;
+        }
+        if self.flag(FLAG_C) || (!self.flag(FLAG_N) && a > 0x99) {
+            adjust |= 0x60;
+            set_carry = true;
+        }
+        a = if self.flag(FLAG_N) {
+            a.wrapping_sub(adjust)
+        } else {
+            a.wrapping_add(adjust)
+        };
+        self.a = a;
+        self.set_flag(FLAG_Z, a == 0);
+        self.set_flag(FLAG_H, false);
+        self.set_flag(FLAG_C, set_carry);
+    }
+
+    // Decode the 2-bit condition field (NZ=0, Z=1, NC=2, C=3) used by JR/JP/CALL/RET cc.
+    fn cond(&self, cc: u8) -> bool {
+        match cc & 3 {
+            0 => !self.flag(FLAG_Z),
+            1 => self.flag(FLAG_Z),
+            2 => !self.flag(FLAG_C),
+            _ => self.flag(FLAG_C),
+        }
+    }
+
+    // ===== CB-prefixed rotate/shift primitives =================================
+    // Unlike the A-rotates (RLCA etc.), these set Z from the *result*. N and H are always
+    // cleared; C takes the bit shifted out. set_shift_flags centralizes that rule.
+    fn set_shift_flags(&mut self, res: u8, carry: u8) {
+        self.set_flag(FLAG_Z, res == 0);
+        self.set_flag(FLAG_N, false);
+        self.set_flag(FLAG_H, false);
+        self.set_flag(FLAG_C, carry != 0);
+    }
+    fn cb_rlc(&mut self, v: u8) -> u8 {
+        let c = v >> 7;
+        let r = (v << 1) | c; // bit 7 wraps into bit 0
+        self.set_shift_flags(r, c);
+        r
+    }
+    fn cb_rrc(&mut self, v: u8) -> u8 {
+        let c = v & 1;
+        let r = (v >> 1) | (c << 7); // bit 0 wraps into bit 7
+        self.set_shift_flags(r, c);
+        r
+    }
+    fn cb_rl(&mut self, v: u8) -> u8 {
+        let old = self.flag(FLAG_C) as u8;
+        let c = v >> 7;
+        let r = (v << 1) | old; // old carry shifts into bit 0
+        self.set_shift_flags(r, c);
+        r
+    }
+    fn cb_rr(&mut self, v: u8) -> u8 {
+        let old = self.flag(FLAG_C) as u8;
+        let c = v & 1;
+        let r = (v >> 1) | (old << 7); // old carry shifts into bit 7
+        self.set_shift_flags(r, c);
+        r
+    }
+    fn cb_sla(&mut self, v: u8) -> u8 {
+        let c = v >> 7;
+        let r = v << 1; // shift in a 0
+        self.set_shift_flags(r, c);
+        r
+    }
+    fn cb_sra(&mut self, v: u8) -> u8 {
+        let c = v & 1;
+        let r = (v >> 1) | (v & 0x80); // arithmetic: bit 7 is preserved (sign)
+        self.set_shift_flags(r, c);
+        r
+    }
+    fn cb_srl(&mut self, v: u8) -> u8 {
+        let c = v & 1;
+        let r = v >> 1; // logical: bit 7 becomes 0
+        self.set_shift_flags(r, c);
+        r
+    }
+    fn cb_swap(&mut self, v: u8) -> u8 {
+        let r = (v >> 4) | (v << 4); // swap nibbles
+        self.set_flag(FLAG_Z, r == 0);
+        self.set_flag(FLAG_N, false);
+        self.set_flag(FLAG_H, false);
+        self.set_flag(FLAG_C, false); // SWAP always clears carry
+        r
+    }
+
     // ===== Decode + execute ====================================================
-    //
-    // ┌─ PAIRING TASK (M1, Liam) ────────────────────────────────────────────────┐
-    // │ Below is the opcode dispatch. I've implemented ONE worked example per       │
-    // │ category — copy the pattern to fill in the rest. The catch-all `panic!`     │
-    // │ prints the exact unimplemented opcode + PC, so the workflow is:             │
-    // │   run `cargo run -- roms\tetris.gb 200`  ->  it panics on opcode 0xNN  ->   │
-    // │   implement 0xNN here  ->  rerun. Repeat until it single-steps cleanly.     │
-    // │                                                                             │
-    // │ Worked examples to mirror:                                                  │
-    // │   • LD r,r'   (0x40-0x7F)  -> reg()/set_reg() + the (HL) cycle bump          │
-    // │   • ADD A,r   (0x80-0x87)  -> set_flag() + hc_add() for the half-carry       │
-    // │   • LD A,n    (0x3E)       -> fetch8()                                       │
-    // │   • LD BC,nn  (0x01)       -> fetch16()                                      │
-    // │   • JP nn / JR e           -> absolute vs signed-relative control flow       │
-    // │ Tools ready for your families: push16()/pop16() (PUSH/POP/CALL/RET/RST),     │
-    // │   hc_add()/hc_sub() (ADC/SUB/SBC/CP), set_flag()/flag().                     │
-    // │ Condition codes for the cc-variants (JR cc, JP cc, CALL cc, RET cc): the     │
-    // │   2-bit field is NZ=0, Z=1, NC=2, C=3.                                       │
-    // └─────────────────────────────────────────────────────────────────────────┘
+    // The full legal SM83 opcode set. The structure mirrors the opcode map's own layout:
+    //   0x00-0x3F  misc, 16-bit loads, INC/DEC, the A-rotates, JR
+    //   0x40-0x7F  LD r,r' (one range arm; 0x76 is HALT, carved out first)
+    //   0x80-0xBF  ALU A,r (one range arm; the sub-op is bits 5-3)
+    //   0xC0-0xFF  control flow, stack, immediate ALU, LDH, RST, CB prefix
+    // Conditional control flow and the (HL) operand cost extra cycles; those arms return
+    // the right count per branch. Illegal opcodes (0xD3, 0xDB, 0xDD, ...) fall through to
+    // the catch-all, which now signals a runaway PC rather than "not yet implemented".
     fn dispatch(&mut self, op: u8) -> u8 {
         match op {
             0x00 => 4, // NOP
-
-            // --- worked: 16-bit immediate load (you add LD DE/HL/SP,nn: 0x11/0x21/0x31) ---
-            0x01 => {
-                let v = self.fetch16();
-                self.set_bc(v);
-                12
-            }
-
-            0x11 => {
-                let v = self.fetch16();
-                self.set_de(v);
-                12
-            }
-
-            0x21 => {
-                let v = self.fetch16();
-                self.set_hl(v);
-                12
-            }
-
-            0x31 => {
-                self.sp = self.fetch16();
-                12
-            }
-
-
-            // --- worked: 8-bit immediate load (you add LD B/C/D/E/H/L/(HL),n) ---
-            0x02 => {
-                let addr = self.bc();
-                self.bus.write(addr, self.a);
-                8
-            }
-
-            0x12 => {
-                let addr = self.de();
-                self.bus.write(addr, self.a);
-                8
-            }
-
-            0x22 => {
-                let addr = self.hl();
-                self.bus.write(addr, self.a);
-                self.set_hl(addr.wrapping_add(1));
-                8
-            }
-
-            0x32 => {
-                let addr = self.hl();
-                self.bus.write(addr, self.a);
-                self.set_hl(addr.wrapping_sub(1));
-                8
-            }
-
-            0x06 => {
-                self.b = self.fetch8();
-                8
-            }
-
-            0x16 => {
-                self.d = self.fetch8();
-                8
-            }
-
-            0x26 => {
-                self.h = self.fetch8();
-                8
-            }
-
-            0x36 => {
-                let addr = self.hl();
-                self.bus.write(addr, self.fetch8());
-                12
-            }
-
-            0x3E => {
-                self.a = self.fetch8();
-                8
-            }
-
-            0x2E => {
-                self.l = self.fetch8();
-                8
-            }
-
-            0x1E => {
-                self.e = self.fetch8();
-                8
-            }
-
-            0x0E => {
-                self.c = self.fetch8();
-                8
-            }
-
-            // HALT must be matched before the LD r,r' block (0x76 sits inside it).
-            0x76 => {
-                self.halt();
+            0x10 => {
+                // STOP — a 2-byte opcode (0x10 0x00) for low-power / CGB speed switch.
+                // Out of scope here (no double-speed), so consume the pad byte and idle.
+                let _ = self.fetch8();
                 4
             }
 
-            // --- worked: LD r, r' (one arm covers the whole 0x40-0x7F block) ---
+            // --- 16-bit immediate loads: LD rr,nn ---
+            0x01 => { let v = self.fetch16(); self.set_bc(v); 12 }
+            0x11 => { let v = self.fetch16(); self.set_de(v); 12 }
+            0x21 => { let v = self.fetch16(); self.set_hl(v); 12 }
+            0x31 => { self.sp = self.fetch16(); 12 }
+
+            // --- store A into memory at a 16-bit pointer (HL auto-adjusts on +/-) ---
+            0x02 => { let a = self.bc(); self.bus.write(a, self.a); 8 }
+            0x12 => { let a = self.de(); self.bus.write(a, self.a); 8 }
+            0x22 => { let a = self.hl(); self.bus.write(a, self.a); self.set_hl(a.wrapping_add(1)); 8 }
+            0x32 => { let a = self.hl(); self.bus.write(a, self.a); self.set_hl(a.wrapping_sub(1)); 8 }
+
+            // --- load A from memory at a 16-bit pointer ---
+            0x0A => { let a = self.bc(); self.a = self.bus.read(a); 8 }
+            0x1A => { let a = self.de(); self.a = self.bus.read(a); 8 }
+            0x2A => { let a = self.hl(); self.a = self.bus.read(a); self.set_hl(a.wrapping_add(1)); 8 }
+            0x3A => { let a = self.hl(); self.a = self.bus.read(a); self.set_hl(a.wrapping_sub(1)); 8 }
+
+            // --- LD (nn),SP : store SP to memory, little-endian ---
+            0x08 => {
+                let addr = self.fetch16();
+                self.bus.write(addr, self.sp as u8);
+                self.bus.write(addr.wrapping_add(1), (self.sp >> 8) as u8);
+                20
+            }
+
+            // --- 8-bit immediate loads: LD r,n  (and LD (HL),n) ---
+            0x06 => { self.b = self.fetch8(); 8 }
+            0x0E => { self.c = self.fetch8(); 8 }
+            0x16 => { self.d = self.fetch8(); 8 }
+            0x1E => { self.e = self.fetch8(); 8 }
+            0x26 => { self.h = self.fetch8(); 8 }
+            0x2E => { self.l = self.fetch8(); 8 }
+            0x36 => { let a = self.hl(); let v = self.fetch8(); self.bus.write(a, v); 12 }
+            0x3E => { self.a = self.fetch8(); 8 }
+
+            // --- 16-bit INC/DEC: no flags touched ---
+            0x03 => { let v = self.bc().wrapping_add(1); self.set_bc(v); 8 }
+            0x13 => { let v = self.de().wrapping_add(1); self.set_de(v); 8 }
+            0x23 => { let v = self.hl().wrapping_add(1); self.set_hl(v); 8 }
+            0x33 => { self.sp = self.sp.wrapping_add(1); 8 }
+            0x0B => { let v = self.bc().wrapping_sub(1); self.set_bc(v); 8 }
+            0x1B => { let v = self.de().wrapping_sub(1); self.set_de(v); 8 }
+            0x2B => { let v = self.hl().wrapping_sub(1); self.set_hl(v); 8 }
+            0x3B => { self.sp = self.sp.wrapping_sub(1); 8 }
+
+            // --- ADD HL,rr ---
+            0x09 => { self.add_hl(self.bc()); 8 }
+            0x19 => { self.add_hl(self.de()); 8 }
+            0x29 => { self.add_hl(self.hl()); 8 }
+            0x39 => { self.add_hl(self.sp); 8 }
+
+            // --- 8-bit INC r / DEC r (covers (HL) at idx 6, which costs 12) ---
+            0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 | 0x3C => {
+                let idx = (op >> 3) & 7;
+                let v = self.reg(idx);
+                let r = self.alu_inc(v);
+                self.set_reg(idx, r);
+                if idx == 6 { 12 } else { 4 }
+            }
+            0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D => {
+                let idx = (op >> 3) & 7;
+                let v = self.reg(idx);
+                let r = self.alu_dec(v);
+                self.set_reg(idx, r);
+                if idx == 6 { 12 } else { 4 }
+            }
+
+            // --- the A-rotates: like the CB rotates but Z is FORCED to 0 ---
+            0x07 => { let r = self.cb_rlc(self.a); self.a = r; self.set_flag(FLAG_Z, false); 4 } // RLCA
+            0x0F => { let r = self.cb_rrc(self.a); self.a = r; self.set_flag(FLAG_Z, false); 4 } // RRCA
+            0x17 => { let r = self.cb_rl(self.a);  self.a = r; self.set_flag(FLAG_Z, false); 4 } // RLA
+            0x1F => { let r = self.cb_rr(self.a);  self.a = r; self.set_flag(FLAG_Z, false); 4 } // RRA
+
+            // --- accumulator / flag misc ---
+            0x27 => { self.daa(); 4 } // DAA
+            0x2F => { self.a = !self.a; self.set_flag(FLAG_N, true); self.set_flag(FLAG_H, true); 4 } // CPL
+            0x37 => { self.set_flag(FLAG_N, false); self.set_flag(FLAG_H, false); self.set_flag(FLAG_C, true); 4 } // SCF
+            0x3F => { let c = self.flag(FLAG_C); self.set_flag(FLAG_N, false); self.set_flag(FLAG_H, false); self.set_flag(FLAG_C, !c); 4 } // CCF
+
+            // --- relative jumps: JR e (always) and JR cc,e (taken=12 / not=8) ---
+            0x18 => { let e = self.fetch8() as i8; self.pc = self.pc.wrapping_add(e as u16); 12 }
+            0x20 | 0x28 | 0x30 | 0x38 => {
+                let e = self.fetch8() as i8; // operand is consumed whether or not we branch
+                if self.cond((op >> 3) & 3) {
+                    self.pc = self.pc.wrapping_add(e as u16);
+                    12
+                } else {
+                    8
+                }
+            }
+
+            // HALT (0x76) must be matched before the LD r,r' block it sits inside.
+            0x76 => { self.halt(); 4 }
+
+            // --- LD r,r' : one arm for the whole 0x40-0x7F block ---
             0x40..=0x7F => {
                 let dst = (op >> 3) & 7;
                 let src = op & 7;
@@ -374,72 +573,143 @@ impl Cpu {
                 if dst == 6 || src == 6 { 8 } else { 4 } // (HL) adds a memory cycle
             }
 
-            // --- worked: ADD A, r (mirror this for ADC/SUB/SBC/AND/XOR/OR/CP) ---
-            0x80..=0x87 => {
+            // --- ALU A,r : one arm for the whole 0x80-0xBF block; sub-op is bits 5-3 ---
+            0x80..=0xBF => {
                 let val = self.reg(op & 7);
-                let (res, carry) = self.a.overflowing_add(val);
-                self.set_flag(FLAG_Z, res == 0);
-                self.set_flag(FLAG_N, false);
-                self.set_flag(FLAG_H, hc_add(self.a, val));
-                self.set_flag(FLAG_C, carry);
-                self.a = res;
+                match (op >> 3) & 7 {
+                    0 => self.alu_add(val),
+                    1 => self.alu_adc(val),
+                    2 => self.alu_sub(val),
+                    3 => self.alu_sbc(val),
+                    4 => self.alu_and(val),
+                    5 => self.alu_xor(val),
+                    6 => self.alu_or(val),
+                    _ => self.alu_cp(val),
+                }
                 if (op & 7) == 6 { 8 } else { 4 }
             }
 
-            0xA8..=0xAF => {
-                let val = self.reg(op & 7);
-            }
+            // --- ALU A,n : immediate forms reuse the same primitives ---
+            0xC6 => { let n = self.fetch8(); self.alu_add(n); 8 }
+            0xCE => { let n = self.fetch8(); self.alu_adc(n); 8 }
+            0xD6 => { let n = self.fetch8(); self.alu_sub(n); 8 }
+            0xDE => { let n = self.fetch8(); self.alu_sbc(n); 8 }
+            0xE6 => { let n = self.fetch8(); self.alu_and(n); 8 }
+            0xEE => { let n = self.fetch8(); self.alu_xor(n); 8 }
+            0xF6 => { let n = self.fetch8(); self.alu_or(n); 8 }
+            0xFE => { let n = self.fetch8(); self.alu_cp(n); 8 }
 
-            // --- worked: control flow ---
-            0xC3 => {
-                // JP nn — unconditional absolute jump.
+            // --- POP / PUSH (POP AF masks F's low nibble via set_af) ---
+            0xC1 => { let v = self.pop16(); self.set_bc(v); 12 }
+            0xD1 => { let v = self.pop16(); self.set_de(v); 12 }
+            0xE1 => { let v = self.pop16(); self.set_hl(v); 12 }
+            0xF1 => { let v = self.pop16(); self.set_af(v); 12 }
+            0xC5 => { self.push16(self.bc()); 16 }
+            0xD5 => { self.push16(self.de()); 16 }
+            0xE5 => { self.push16(self.hl()); 16 }
+            0xF5 => { self.push16(self.af()); 16 }
+
+            // --- absolute jumps: JP nn, JP cc,nn (taken=16 / not=12), JP (HL) ---
+            0xC3 => { let addr = self.fetch16(); self.pc = addr; 16 }
+            0xC2 | 0xCA | 0xD2 | 0xDA => {
                 let addr = self.fetch16();
-                self.pc = addr;
+                if self.cond((op >> 3) & 3) { self.pc = addr; 16 } else { 12 }
+            }
+            0xE9 => { self.pc = self.hl(); 4 } // JP (HL): despite the parens, it's pc=HL, no memory read
+
+            // --- calls and returns ---
+            0xCD => { let addr = self.fetch16(); self.push16(self.pc); self.pc = addr; 24 }
+            0xC4 | 0xCC | 0xD4 | 0xDC => {
+                let addr = self.fetch16();
+                if self.cond((op >> 3) & 3) { self.push16(self.pc); self.pc = addr; 24 } else { 12 }
+            }
+            0xC9 => { self.pc = self.pop16(); 16 } // RET
+            0xC0 | 0xC8 | 0xD0 | 0xD8 => {
+                if self.cond((op >> 3) & 3) { self.pc = self.pop16(); 20 } else { 8 }
+            }
+            0xD9 => { self.pc = self.pop16(); self.ime = true; 16 } // RETI — IME on IMMEDIATELY (no EI delay)
+
+            // --- RST n : push PC, jump to a fixed low vector (op & 0x38) ---
+            0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => {
+                self.push16(self.pc);
+                self.pc = (op & 0x38) as u16;
                 16
             }
-            0x18 => {
-                // JR e — relative jump; the operand is a SIGNED offset from the PC
-                // *after* the offset byte (which fetch8 has already stepped past).
-                let offset = self.fetch8() as i8;
-                self.pc = self.pc.wrapping_add(offset as u16);
-                12
-            }
 
-            // --- system / interrupts ---
-            0xF3 => {
-                // DI — disable interrupts immediately (and cancel any pending EI).
-                self.ime = false;
-                self.ime_pending = false;
-                4
-            }
-            0xFB => {
-                // EI — enable interrupts AFTER the next instruction (the delay).
-                self.ime_pending = true;
-                4
-            }
+            // --- high-page (0xFF00+offset) and absolute accumulator loads ---
+            0xE0 => { let n = self.fetch8(); self.bus.write(0xFF00 + n as u16, self.a); 12 } // LDH (n),A
+            0xF0 => { let n = self.fetch8(); self.a = self.bus.read(0xFF00 + n as u16); 12 } // LDH A,(n)
+            0xE2 => { self.bus.write(0xFF00 + self.c as u16, self.a); 8 } // LD (C),A
+            0xF2 => { self.a = self.bus.read(0xFF00 + self.c as u16); 8 } // LD A,(C)
+            0xEA => { let addr = self.fetch16(); self.bus.write(addr, self.a); 16 } // LD (nn),A
+            0xFA => { let addr = self.fetch16(); self.a = self.bus.read(addr); 16 } // LD A,(nn)
 
-            // The 0xCB-prefixed bit/rotate/shift family is M2 (see dispatch_cb).
-            0xCB => {
-                let cb = self.fetch8();
-                self.dispatch_cb(cb)
-            }
+            // --- SP arithmetic / transfer ---
+            0xE8 => { let e = self.fetch8() as i8; self.sp = self.add_sp_e(e); 16 } // ADD SP,e
+            0xF8 => { let e = self.fetch8() as i8; let v = self.add_sp_e(e); self.set_hl(v); 12 } // LD HL,SP+e
+            0xF9 => { self.sp = self.hl(); 8 } // LD SP,HL
+
+            // --- interrupt master enable flags ---
+            0xF3 => { self.ime = false; self.ime_pending = false; 4 } // DI (also cancels a pending EI)
+            0xFB => { self.ime_pending = true; 4 } // EI — enable AFTER the next instruction
+
+            // --- the 0xCB prefix opens the bit/rotate/shift page ---
+            0xCB => { let cb = self.fetch8(); self.dispatch_cb(cb) }
 
             other => panic!(
-                "unimplemented opcode 0x{:02X} at PC 0x{:04X} — implement it in cpu.rs dispatch()",
+                "illegal/unimplemented opcode 0x{:02X} at PC 0x{:04X} — the full legal SM83 \
+                 set is implemented, so this is almost certainly a runaway PC (a control-flow \
+                 or stack bug jumped into data)",
                 other,
                 self.pc.wrapping_sub(1)
             ),
         }
     }
 
-    /// 0xCB-prefixed opcodes (rotate / shift / SWAP / BIT / RES / SET). Implemented in
-    /// M2 — it's a very regular 8-registers × operation grid, ideal opcode practice.
+    /// 0xCB-prefixed opcodes: a regular grid decoded by bit-fields rather than a giant
+    /// table. Bits 7-6 pick the family, bits 5-3 the bit-index / shift-op, bits 2-0 the
+    /// operand register (same 0=B..6=(HL)..7=A encoding as everywhere else).
     fn dispatch_cb(&mut self, cb: u8) -> u8 {
-        panic!(
-            "unimplemented CB opcode 0xCB 0x{:02X} at PC 0x{:04X} — the CB family lands in M2",
-            cb,
-            self.pc.wrapping_sub(2)
-        );
+        let idx = cb & 7; // operand register
+        let bit = (cb >> 3) & 7; // bit index (BIT/RES/SET) or rotate/shift selector
+        let val = self.reg(idx);
+        let is_hl = idx == 6;
+
+        match cb >> 6 {
+            // 0b00 — rotate / shift / SWAP, chosen by `bit`.
+            0 => {
+                let res = match bit {
+                    0 => self.cb_rlc(val),
+                    1 => self.cb_rrc(val),
+                    2 => self.cb_rl(val),
+                    3 => self.cb_rr(val),
+                    4 => self.cb_sla(val),
+                    5 => self.cb_sra(val),
+                    6 => self.cb_swap(val),
+                    _ => self.cb_srl(val),
+                };
+                self.set_reg(idx, res);
+                if is_hl { 16 } else { 8 }
+            }
+            // 0b01 — BIT b,r : test bit -> Z, N=0, H=1, C untouched. No write-back, and the
+            // (HL) form is only 12 cycles (it reads but never writes).
+            1 => {
+                self.set_flag(FLAG_Z, val & (1 << bit) == 0);
+                self.set_flag(FLAG_N, false);
+                self.set_flag(FLAG_H, true);
+                if is_hl { 12 } else { 8 }
+            }
+            // 0b10 — RES b,r : clear a bit. No flags.
+            2 => {
+                self.set_reg(idx, val & !(1 << bit));
+                if is_hl { 16 } else { 8 }
+            }
+            // 0b11 — SET b,r : set a bit. No flags.
+            _ => {
+                self.set_reg(idx, val | (1 << bit));
+                if is_hl { 16 } else { 8 }
+            }
+        }
     }
 }
 
@@ -451,8 +721,7 @@ fn hc_add(a: u8, b: u8) -> bool {
     (a & 0x0F) + (b & 0x0F) > 0x0F
 }
 // For an 8-bit SUB it's a borrow: the low nibble of a is smaller than that of b.
-// (For ADC/SBC, fold the incoming carry into the low-nibble math: `+ carry` / the
-//  comparison `(a & 0xF) < (b & 0xF) + carry`.)
+// (ADC/SBC fold the incoming carry into the low-nibble math directly in alu_adc/alu_sbc.)
 fn hc_sub(a: u8, b: u8) -> bool {
     (a & 0x0F) < (b & 0x0F)
 }
