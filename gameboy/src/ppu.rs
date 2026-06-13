@@ -41,8 +41,9 @@ pub struct Ppu {
     pub frame_ready: bool,
 
     // --- internal mode-FSM state (not visible to the CPU) ---
-    dots: u16,    // dot counter within the current scanline (0..456)
-    mode: u8,     // current PPU mode: 2=OAM scan, 3=drawing, 0=HBlank, 1=VBlank
+    dots: u16,       // dot counter within the current scanline (0..456)
+    mode: u8,        // current PPU mode: 2=OAM scan, 3=drawing, 0=HBlank, 1=VBlank
+    window_line: u8, // the window's own row counter (advances only on lines it draws)
 }
 
 impl Ppu {
@@ -66,6 +67,7 @@ impl Ppu {
             frame_ready: false,
             dots: 0,
             mode: 2,
+            window_line: 0,
         }
     }
 
@@ -99,6 +101,8 @@ impl Ppu {
                 // Just stepped onto line 144: the visible frame is done.
                 self.frame_ready = true;
                 ints.request(interrupts::VBLANK);
+                // The window's row counter restarts at the top of each new frame.
+                self.window_line = 0;
             }
         }
 
@@ -176,34 +180,74 @@ impl Ppu {
     /// │ follow-on once the background is on screen.                                    │
     /// └────────────────────────────────────────────────────────────────────────────────┘
     fn render_scanline(&mut self) {
-        // TODO(M4, Liam): implement the per-pixel background fetch described above.
         let ly = self.ly as usize;
-        let map_base: usize = if self.lcdc & 0x08 != 0 { 0x1C00 } else { 0x1800 };
+
+        // DMG quirk: LCDC bit 0 clear blanks BOTH the background and the window — the
+        // whole line is color 0. (On CGB this bit means something else; we're DMG.)
+        if self.lcdc & 0x01 == 0 {
+            for x in 0..SCREEN_W {
+                self.framebuffer[ly * SCREEN_W + x] = 0;
+            }
+            return;
+        }
+
+        // Both layers share the same tile-data addressing mode (LCDC bit 4).
         let unsigned = self.lcdc & 0x10 != 0;
 
+        // --- Background: a 256x256 space the screen scrolls around with SCX/SCY ---
+        let bg_map: usize = if self.lcdc & 0x08 != 0 { 0x1C00 } else { 0x1800 };
         for x in 0..SCREEN_W {
-            let bg_y = (ly + self.scy as usize) & 0xFF;
+            let bg_y = (ly + self.scy as usize) & 0xFF; // wraps at 256
             let bg_x = (x + self.scx as usize) & 0xFF;
-
-            let tile_id = self.vram[map_base + bg_y/8 * 32 + bg_x/8];
-
-            let data: usize = if unsigned {
-                (tile_id as usize) * 16
-            }else{
-                (0x1000 + (tile_id as i8 as i16) * 16) as usize
-            };
-
-            let row = bg_y % 8;
-            let lo = self.vram[data + row * 2];
-            let hi = self.vram[data + row * 2 + 1];
-
-            // the 2bpp decode
-            let bit = 7 - (bg_x % 8);
-            let color_id = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
-
-            let shade = (self.bgp >> (color_id * 2)) & 3;
+            let shade = self.bg_pixel(bg_map, bg_x, bg_y, unsigned);
             self.framebuffer[ly * SCREEN_W + x] = shade;
         }
+
+        // --- Window: a second layer drawn OVER the background ---
+        // The window ignores SCX/SCY. It's anchored on screen at (WX-7, WY) and walks its
+        // own internal row counter. It appears on this line only if it's enabled (LCDC
+        // bit 5) and we've reached its top edge (LY >= WY).
+        let window_enabled = self.lcdc & 0x20 != 0;
+        if window_enabled && ly >= self.wy as usize {
+            let win_map: usize = if self.lcdc & 0x40 != 0 { 0x1C00 } else { 0x1800 };
+            let win_y = self.window_line as usize;
+            let win_start = self.wx as i16 - 7; // screen x where the window's column 0 sits
+            for x in 0..SCREEN_W {
+                if (x as i16) < win_start {
+                    continue; // this pixel is to the left of the window
+                }
+                let win_x = (x as i16 - win_start) as usize;
+                let shade = self.bg_pixel(win_map, win_x, win_y, unsigned);
+                self.framebuffer[ly * SCREEN_W + x] = shade;
+            }
+            // Advance once per line the window is shown — deliberately NOT `ly - WY`, so
+            // toggling the window mid-frame can't desync its vertical position.
+            self.window_line += 1;
+        }
+    }
+
+    /// Fetch one background/window pixel and map it through BGP to a shade (0..=3).
+    /// `(px, py)` are coordinates inside the chosen 256x256 tile-map space and `map_base`
+    /// is that map's VRAM offset (0x1800 or 0x1C00). The background and window share this
+    /// because the lookup is identical — only the coordinates and the map differ.
+    fn bg_pixel(&self, map_base: usize, px: usize, py: usize, unsigned: bool) -> u8 {
+        // 1. tile number from the 32-wide map
+        let tile_id = self.vram[map_base + (py / 8) * 32 + (px / 8)];
+        // 2. where that tile's 16 bytes live (the signed/unsigned addressing modes)
+        let data: usize = if unsigned {
+            (tile_id as usize) * 16
+        } else {
+            (0x1000 + (tile_id as i8 as i16) * 16) as usize
+        };
+        // 3. the two bytes (bit-planes) of this row of the tile
+        let row = py % 8;
+        let lo = self.vram[data + row * 2];
+        let hi = self.vram[data + row * 2 + 1];
+        // 4. recombine the planes; bit 7 is the leftmost pixel
+        let bit = 7 - (px % 8);
+        let color_id = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
+        // 5. color id -> shade through the background palette
+        (self.bgp >> (color_id * 2)) & 3
     }
 
     pub fn read(&self, addr: u16) -> u8 {
