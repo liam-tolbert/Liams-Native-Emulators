@@ -21,3 +21,4 @@ target/
 /gameboy/roms/
 /gameboy/scratch/
 *.txt
+/CLAUDE.md

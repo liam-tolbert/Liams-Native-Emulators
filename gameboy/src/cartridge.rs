@@ -23,6 +23,14 @@ pub struct Header {
 pub struct Cartridge {
     rom: Vec<u8>,
     pub header: Header,
+
+    // --- Banking state. A NoMBC cart never touches these. MBC1 carts use them to map a
+    //     16 KiB bank into the 0x4000-0x7FFF window. This is a *minimal* MBC1: ROM-bank
+    //     selection only, enough for the multi-bank Blargg test ROMs (and small MBC1
+    //     games). Full MBC1 (RAM banking, the banking-mode flag, save RAM) is M7. ---
+    mbc1: bool,
+    rom_bank: usize,      // bank currently mapped at 0x4000-0x7FFF (forced >= 1)
+    rom_bank_mask: usize, // (bank_count - 1); keeps a selected bank inside the real ROM
 }
 
 impl Cartridge {
@@ -33,23 +41,57 @@ impl Cartridge {
             rom.len()
         );
         let header = parse_header(&rom);
-        Cartridge { rom, header }
+        // ROM bank counts are always powers of two (2 << code), so (count - 1) is a clean
+        // wrap-around mask. The bus only routes MBC writes here when this is an MBC1 cart.
+        let mbc1 = matches!(header.cart_type, 0x01..=0x03);
+        let rom_bank_mask = (header.rom_banks.max(1) - 1) as usize;
+        Cartridge { rom, header, mbc1, rom_bank: 1, rom_bank_mask }
     }
 
     /// The CPU's view of the cartridge address space (0x0000-0x7FFF ROM,
     /// 0xA000-0xBFFF external RAM). The bus routes those ranges here.
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
-            // NoMBC: the (up to) 32 KiB ROM is mapped directly. Banking arrives in M7.
-            0x0000..=0x7FFF => *self.rom.get(addr as usize).unwrap_or(&0xFF),
-            0xA000..=0xBFFF => 0xFF, // a ROM-only cart has no external RAM
+            // 0x0000-0x3FFF is always ROM bank 0.
+            0x0000..=0x3FFF => *self.rom.get(addr as usize).unwrap_or(&0xFF),
+            // 0x4000-0x7FFF is the switchable window. NoMBC carts read on linearly (this
+            // is just bank 1); MBC1 carts read whichever bank is currently selected.
+            0x4000..=0x7FFF => {
+                let bank = if self.mbc1 {
+                    (self.rom_bank & self.rom_bank_mask).max(1)
+                } else {
+                    1
+                };
+                let off = bank * 0x4000 + (addr as usize - 0x4000);
+                *self.rom.get(off).unwrap_or(&0xFF)
+            }
+            0xA000..=0xBFFF => 0xFF, // no external RAM wired up yet
             _ => 0xFF,
         }
     }
 
-    pub fn write(&mut self, _addr: u16, _val: u8) {
-        // NoMBC: writes into the ROM region are ignored. On a real MBC cart these
-        // writes are how the game selects ROM/RAM banks — that logic lands in M7.
+    pub fn write(&mut self, addr: u16, val: u8) {
+        // NoMBC: ROM-region writes are ignored. On an MBC cart they're not memory writes
+        // at all — they're commands to the mapper hardware selecting banks.
+        if !self.mbc1 {
+            return;
+        }
+        match addr {
+            0x0000..=0x1FFF => {} // RAM enable — no cart RAM yet, so nothing to gate
+            0x2000..=0x3FFF => {
+                // Low 5 bits of the ROM bank number. MBC1 quirk: writing 0 here selects
+                // bank 1 (the 0x4000 window can never show bank 0).
+                let low = (val & 0x1F) as usize;
+                let low = if low == 0 { 1 } else { low };
+                self.rom_bank = (self.rom_bank & !0x1F) | low;
+            }
+            0x4000..=0x5FFF => {
+                // Upper 2 bits (only relevant for ROMs > 512 KiB) — tracked for completeness.
+                self.rom_bank = (self.rom_bank & 0x1F) | (((val & 0x03) as usize) << 5);
+            }
+            0x6000..=0x7FFF => {} // banking-mode select — irrelevant for these small ROMs
+            _ => {}
+        }
     }
 }
 

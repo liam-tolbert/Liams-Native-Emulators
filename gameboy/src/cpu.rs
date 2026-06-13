@@ -233,7 +233,6 @@ impl Cpu {
     fn halt(&mut self) {
         // HALT bug: if IME is off but an interrupt is ALREADY pending, the CPU does not
         // halt — instead the byte after HALT is read twice (PC fails to advance once).
-        // Real games rely on this; we model it with the `halt_bug` fetch latch.
         let pending = self.bus.ints.pending() != 0;
         if !self.ime && pending {
             self.halt_bug = true;
@@ -244,9 +243,7 @@ impl Cpu {
 
     // ===== ALU primitives ======================================================
     // Each operates on the accumulator the way the hardware does and sets F to match.
-    // Implementing the flag rules ONCE here (instead of in every opcode arm) is what
-    // keeps Blargg-level correctness tractable — the half-carry rules in particular are
-    // the #1 source of subtle bugs, so they exist in exactly one place per operation.
+    // Implementing the flag rules ONCE here (instead of in every opcode arm)
 
     fn alu_add(&mut self, val: u8) {
         let (res, carry) = self.a.overflowing_add(val);

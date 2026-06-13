@@ -39,8 +39,11 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Optional 2nd arg: how many instructions to single-step (0 = just load + header).
-    let trace_steps: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Optional 2nd arg selects what to do after loading the ROM:
+    //   (none)  -> just print the header  (the M0 check)
+    //   <N>     -> single-step N instructions with a register trace  (M1 debugging)
+    //   run     -> free-run until the ROM prints a serial verdict  (Blargg cpu_instrs)
+    let mode = args.get(2).map(String::as_str);
 
     // --- build the machine: cartridge -> bus -> cpu (the CPU owns the bus) ---
     let cart = Cartridge::new(rom);
@@ -57,27 +60,66 @@ fn main() {
         println!("  Cart RAM   : {} bytes", h.ram_bytes);
     }
 
-    // --- M1 single-step harness: `cargo run -- <rom> <N>` traces N instructions ---
-    // Each line shows the next opcode and the register file *before* it executes; the
-    // CPU panics on the first opcode you haven't implemented yet (telling you which).
-    if trace_steps > 0 {
-        let mut cpu = Cpu::new(bus);
-        println!("\n-- single-step trace ({trace_steps} instructions) --");
-        for _ in 0..trace_steps {
-            let pc = cpu.pc;
-            let op = cpu.bus.read(pc);
-            println!(
-                "PC:{:04X}  op:{:02X}   AF:{:04X} BC:{:04X} DE:{:04X} HL:{:04X} SP:{:04X}  ime:{}",
-                pc,
-                op,
-                cpu.af(),
-                cpu.bc(),
-                cpu.de(),
-                cpu.hl(),
-                cpu.sp,
-                cpu.ime as u8
-            );
-            cpu.step();
+    match mode {
+        // --- M1 single-step harness: `cargo run -- <rom> <N>` traces N instructions ---
+        // Each line shows the next opcode and the register file *before* it executes; the
+        // CPU panics on the first illegal opcode (telling you which + the PC).
+        Some(n) if n.bytes().all(|b| b.is_ascii_digit()) => {
+            let trace_steps: u32 = n.parse().unwrap_or(0);
+            let mut cpu = Cpu::new(bus);
+            println!("\n-- single-step trace ({trace_steps} instructions) --");
+            for _ in 0..trace_steps {
+                let pc = cpu.pc;
+                let op = cpu.bus.read(pc);
+                println!(
+                    "PC:{:04X}  op:{:02X}   AF:{:04X} BC:{:04X} DE:{:04X} HL:{:04X} SP:{:04X}  ime:{}",
+                    pc,
+                    op,
+                    cpu.af(),
+                    cpu.bc(),
+                    cpu.de(),
+                    cpu.hl(),
+                    cpu.sp,
+                    cpu.ime as u8
+                );
+                cpu.step();
+            }
         }
+
+        // --- Headless test harness: `cargo run --release -- <rom> run` -----------------
+        // Blargg's CPU test ROMs write their results to the serial port (the bus prints
+        // each character as it arrives). We just run the CPU until that text contains a
+        // "Passed" / "Failed" verdict, with a generous instruction cap so a buggy core
+        // can't spin forever. This is the whole point of CPU-correctness-before-graphics:
+        // we validate the core with no PPU, exactly the trick we'll reuse on the PS1.
+        Some("run") => {
+            let mut cpu = Cpu::new(bus);
+            println!("\n-- running (serial output below) --");
+            const MAX_INSTRS: u64 = 300_000_000;
+            let mut last_len = 0usize;
+            let mut verdict = false;
+            for _ in 0..MAX_INSTRS {
+                cpu.step();
+                // Only scan the (tiny) serial string when it actually grew.
+                let out = &cpu.bus.serial_out;
+                if out.len() != last_len {
+                    last_len = out.len();
+                    if out.contains("Passed") || out.contains("Failed") {
+                        verdict = true;
+                        break;
+                    }
+                }
+            }
+            println!();
+            if !verdict {
+                eprintln!(
+                    "(stopped after {MAX_INSTRS} instructions with no Passed/Failed verdict — \
+                     the ROM may be stuck; try a single-step trace to see where)"
+                );
+            }
+        }
+
+        // No 2nd arg (or anything else): header-only, the M0 behavior.
+        _ => {}
     }
 }
