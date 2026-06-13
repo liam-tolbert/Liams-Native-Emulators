@@ -14,7 +14,8 @@
 use crate::interrupts::{self, Interrupts};
 
 pub struct Timer {
-    pub div: u8,
+    pub div_counter: u16,
+    pub last_signal: bool,
     pub tima: u8,
     pub tma: u8,
     pub tac: u8,
@@ -24,7 +25,7 @@ pub struct Timer {
 
 impl Timer {
     pub fn new() -> Self {
-        Self { div: 0, tima: 0, tma: 0, tac: 0xF8 }
+        Self { div_counter: 0, last_signal: false, tima: 0, tma: 0, tac: 0xF8 }
     }
 
     /// Advance by the T-cycles the last instruction consumed (the catch-up seam).
@@ -33,12 +34,26 @@ impl Timer {
         // edge of the TAC-selected bit; on TIMA overflow reload from TMA and
         // `_ints.request(interrupts::TIMER)`. (The `interrupts` import is here ready
         // for you.)
-        let _ = interrupts::TIMER;
+
+        for _ in 0.._t_cycles {
+            self.div_counter = self.div_counter.wrapping_add(1);
+            let bit = [9,3,5,7][(self.tac & 0b11) as usize];
+            let signal = ((self.div_counter >> bit) & 1 == 1) && (self.tac & 0b100 != 0);
+            if self.last_signal && !signal{ // falling edge
+                let overflow: bool;
+                (self.tima, overflow) = self.tima.overflowing_add(1);
+                if overflow {
+                    self.tima = self.tma;
+                    _ints.request(interrupts::TIMER)
+                }
+            }
+            self.last_signal = signal;
+        }
     }
 
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
-            0xFF04 => self.div,
+            0xFF04 => (self.div_counter >> 8) as u8,
             0xFF05 => self.tima,
             0xFF06 => self.tma,
             0xFF07 => self.tac | 0xF8, // unused top bits read as 1
@@ -48,7 +63,7 @@ impl Timer {
 
     pub fn write(&mut self, addr: u16, val: u8) {
         match addr {
-            0xFF04 => self.div = 0, // any write to DIV clears it (M3: clear the counter)
+            0xFF04 => self.div_counter = 0, // any write to DIV clears it
             0xFF05 => self.tima = val,
             0xFF06 => self.tma = val,
             0xFF07 => self.tac = val & 0x07,
