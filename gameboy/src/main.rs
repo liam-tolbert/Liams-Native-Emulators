@@ -23,6 +23,8 @@ mod timer;
 use bus::Bus;
 use cartridge::Cartridge;
 use cpu::Cpu;
+use minifb::{Key, Scale, Window, WindowOptions};
+use std::time::{Duration, Instant};
 
 fn main() {
     // --- command line: a single ROM path ---
@@ -119,7 +121,97 @@ fn main() {
             }
         }
 
-        // No 2nd arg (or anything else): header-only, the M0 behavior.
-        _ => {}
+        // --- Headless PPU check: `cargo run --release -- <rom> dump` --------------------
+        // Run a few hundred frames with no window, then report how many framebuffer pixels
+        // are non-blank and print a coarse ASCII thumbnail. Confirms the PPU is drawing
+        // (and roughly *what*) without needing a display.
+        Some("dump") => {
+            let mut cpu = Cpu::new(bus);
+            let frames = 600u32;
+            for _ in 0..frames {
+                let mut guard: u32 = 0;
+                loop {
+                    cpu.step();
+                    if cpu.bus.ppu.frame_ready {
+                        cpu.bus.ppu.frame_ready = false;
+                        break;
+                    }
+                    guard += 1;
+                    if guard > 2_000_000 {
+                        break;
+                    }
+                }
+            }
+            let fb = &cpu.bus.ppu.framebuffer;
+            let nonzero = fb.iter().filter(|&&p| p != 0).count();
+            println!("\nafter {frames} frames: {nonzero}/{} framebuffer pixels non-blank", fb.len());
+            let glyphs = [' ', '.', '+', '#'];
+            for y in (0..ppu::SCREEN_H).step_by(4) {
+                let mut line = String::new();
+                for x in (0..ppu::SCREEN_W).step_by(2) {
+                    line.push(glyphs[(fb[y * ppu::SCREEN_W + x] & 3) as usize]);
+                }
+                println!("{line}");
+            }
+        }
+
+        // --- Windowed run (no 2nd arg): open a window and play the ROM ------------------
+        // Run the CPU until the PPU signals a finished frame, blit the framebuffer, hold
+        // ~59.7 Hz. Keyboard -> joypad wiring arrives in M6; until then a game boots to its
+        // title/attract screen but can't be controlled.
+        None => {
+            const SHADES: [u32; 4] = [0x00FF_FFFF, 0x00AA_AAAA, 0x0055_5555, 0x0000_0000];
+            let mut cpu = Cpu::new(bus);
+
+            let mut window = Window::new(
+                "Game Boy  —  [Esc] to quit",
+                ppu::SCREEN_W,
+                ppu::SCREEN_H,
+                WindowOptions { scale: Scale::X4, ..WindowOptions::default() },
+            )
+            .expect("failed to create window");
+
+            let mut buffer: Vec<u32> = vec![0; ppu::SCREEN_W * ppu::SCREEN_H];
+            let frame_time = Duration::from_micros(16_743); // ~59.7 Hz, the real DMG rate
+
+            while window.is_open() && !window.is_key_down(Key::Escape) {
+                let frame_start = Instant::now();
+
+                // Run one whole emulated frame: step the CPU until the PPU finishes a
+                // frame. The guard stops us wedging the window if a game parks the LCD off.
+                let mut guard: u32 = 0;
+                loop {
+                    cpu.step();
+                    if cpu.bus.ppu.frame_ready {
+                        cpu.bus.ppu.frame_ready = false;
+                        break;
+                    }
+                    guard += 1;
+                    if guard > 2_000_000 {
+                        break;
+                    }
+                }
+
+                // Blit: each palette index (0..=3) -> a gray shade.
+                for (px, &shade) in buffer.iter_mut().zip(cpu.bus.ppu.framebuffer.iter()) {
+                    *px = SHADES[(shade & 0b11) as usize];
+                }
+                window
+                    .update_with_buffer(&buffer, ppu::SCREEN_W, ppu::SCREEN_H)
+                    .expect("failed to update window");
+
+                // (M6) sample window.is_key_down(...) into the joypad here.
+
+                let elapsed = frame_start.elapsed();
+                if elapsed < frame_time {
+                    std::thread::sleep(frame_time - elapsed);
+                }
+            }
+        }
+
+        // Any other 2nd arg: unrecognized.
+        Some(other) => {
+            eprintln!("unknown mode '{other}' — use a number (single-step trace) or 'run' (headless serial)");
+        }
     }
 }
