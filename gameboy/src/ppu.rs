@@ -44,6 +44,7 @@ pub struct Ppu {
     dots: u16,       // dot counter within the current scanline (0..456)
     mode: u8,        // current PPU mode: 2=OAM scan, 3=drawing, 0=HBlank, 1=VBlank
     window_line: u8, // the window's own row counter (advances only on lines it draws)
+    stat_line: bool, // previous level of the STAT interrupt line (for rising-edge detect)
 }
 
 impl Ppu {
@@ -68,6 +69,7 @@ impl Ppu {
             dots: 0,
             mode: 2,
             window_line: 0,
+            stat_line: false,
         }
     }
 
@@ -125,10 +127,11 @@ impl Ppu {
             }
             self.mode = new_mode;
             self.sync_stat_mode();
-            // TODO(M5): STAT interrupt. Fire on the RISING edge of the OR of the enabled
-            // STAT sources (mode 0/1/2 select = STAT bits 3/4/5, LYC=LY = STAT bit 6).
-            // Must be edge-detected or it double-fires. Lands with sprite work in M5.
         }
+
+        // STAT is edge-triggered off the OR of its enabled sources; recompute after every
+        // mode/LY change so it fires exactly once per rising edge.
+        self.refresh_stat_line(ints);
     }
 
     /// Mirror the current mode into STAT bits 0-1 (the CPU reads the mode there).
@@ -143,8 +146,26 @@ impl Ppu {
         } else {
             self.stat &= !(1 << 2);
         }
-        // TODO(M5): when STAT bit 6 (LYC source) is enabled, an LY==LYC transition here
-        // is one of the rising edges that can fire the STAT interrupt.
+        // (When STAT bit 6 — the LYC source — is enabled, an LY==LYC change is one of the
+        // STAT-interrupt rising edges; `refresh_stat_line` picks it up.)
+    }
+
+    /// Recompute the STAT interrupt line and fire LCD_STAT on its rising edge.
+    ///
+    /// The line is the OR of the *enabled* STAT sources: PPU mode == 0 / 1 / 2 (selected by
+    /// STAT bits 3 / 4 / 5) and LY == LYC (STAT bit 6). The interrupt is requested only on a
+    /// false->true transition of that OR — "edge-triggered" — otherwise it would re-fire on
+    /// every step a source stayed active and games would drown in interrupts. `stat_line`
+    /// remembers the previous level so we can see the edge.
+    fn refresh_stat_line(&mut self, ints: &mut Interrupts) {
+        let line = (self.stat & 0x08 != 0 && self.mode == 0)
+            || (self.stat & 0x10 != 0 && self.mode == 1)
+            || (self.stat & 0x20 != 0 && self.mode == 2)
+            || (self.stat & 0x40 != 0 && self.ly == self.lyc);
+        if line && !self.stat_line {
+            ints.request(interrupts::LCD_STAT);
+        }
+        self.stat_line = line;
     }
 
     /// Render the current scanline (`self.ly`) of the background into `framebuffer`.
@@ -181,56 +202,73 @@ impl Ppu {
     /// └────────────────────────────────────────────────────────────────────────────────┘
     fn render_scanline(&mut self) {
         let ly = self.ly as usize;
+        // The BG/window color INDEX (0..3, pre-palette) at each pixel of this line. Sprites
+        // need this for priority: an "OBJ-behind-BG" pixel only shows where the BG index 0.
+        let mut bg_ids = [0u8; SCREEN_W];
 
-        // DMG quirk: LCDC bit 0 clear blanks BOTH the background and the window — the
-        // whole line is color 0. (On CGB this bit means something else; we're DMG.)
-        if self.lcdc & 0x01 == 0 {
+        // DMG quirk: LCDC bit 0 clear blanks the background AND window. Sprites are gated
+        // separately (LCDC bit 1), so we DON'T return — we still fall through to them.
+        if self.lcdc & 0x01 != 0 {
+            // Both layers share the same tile-data addressing mode (LCDC bit 4).
+            let unsigned = self.lcdc & 0x10 != 0;
+
+            // --- Background: a 256x256 space the screen scrolls around with SCX/SCY ---
+            let bg_map: usize = if self.lcdc & 0x08 != 0 { 0x1C00 } else { 0x1800 };
+            for x in 0..SCREEN_W {
+                let bg_y = (ly + self.scy as usize) & 0xFF; // wraps at 256
+                let bg_x = (x + self.scx as usize) & 0xFF;
+                let id = self.bg_color_id(bg_map, bg_x, bg_y, unsigned);
+                bg_ids[x] = id;
+                self.framebuffer[ly * SCREEN_W + x] = (self.bgp >> (id * 2)) & 3;
+            }
+
+            // --- Window: a second layer drawn OVER the background ---
+            // Ignores SCX/SCY; anchored on screen at (WX-7, WY) and walks its own row
+            // counter. Drawn only if enabled (LCDC bit 5) and we've reached its top (LY>=WY).
+            // The window only renders — and its internal line counter only advances — on
+            // scanlines where it's actually ON-SCREEN. WX>=167 (win_start>=160) parks the
+            // window past the right edge so it draws nothing; the counter MUST freeze there.
+            // dmg-acid2 hides the window this way for a mid-frame band to test exactly this:
+            // if the counter keeps ticking, the window content below the band shifts up and
+            // (here) an eye lands on the chin. The counter tracks RENDERING, not just enable.
+            let win_start = self.wx as i16 - 7; // screen x where the window's column 0 sits
+            if self.lcdc & 0x20 != 0 && ly >= self.wy as usize && win_start < SCREEN_W as i16 {
+                let win_map: usize = if self.lcdc & 0x40 != 0 { 0x1C00 } else { 0x1800 };
+                let win_y = self.window_line as usize;
+                for x in 0..SCREEN_W {
+                    if (x as i16) < win_start {
+                        continue; // this pixel is to the left of the window
+                    }
+                    let win_x = (x as i16 - win_start) as usize;
+                    let id = self.bg_color_id(win_map, win_x, win_y, unsigned);
+                    bg_ids[x] = id;
+                    self.framebuffer[ly * SCREEN_W + x] = (self.bgp >> (id * 2)) & 3;
+                }
+                // Advance once per line the window is actually drawn — deliberately NOT
+                // `ly - WY`, so hiding the window mid-frame can't desync its vertical position.
+                self.window_line += 1;
+            }
+        } else {
+            // BG/window off: blank the line. bg_ids stays all-0 (treated as transparent).
             for x in 0..SCREEN_W {
                 self.framebuffer[ly * SCREEN_W + x] = 0;
             }
-            return;
         }
 
-        // Both layers share the same tile-data addressing mode (LCDC bit 4).
-        let unsigned = self.lcdc & 0x10 != 0;
-
-        // --- Background: a 256x256 space the screen scrolls around with SCX/SCY ---
-        let bg_map: usize = if self.lcdc & 0x08 != 0 { 0x1C00 } else { 0x1800 };
-        for x in 0..SCREEN_W {
-            let bg_y = (ly + self.scy as usize) & 0xFF; // wraps at 256
-            let bg_x = (x + self.scx as usize) & 0xFF;
-            let shade = self.bg_pixel(bg_map, bg_x, bg_y, unsigned);
-            self.framebuffer[ly * SCREEN_W + x] = shade;
+        // Sprites draw on top, if enabled (LCDC bit 1), subject to per-sprite priority.
+        if self.lcdc & 0x02 != 0 {
+            self.render_sprites(ly, &bg_ids);
         }
 
-        // --- Window: a second layer drawn OVER the background ---
-        // The window ignores SCX/SCY. It's anchored on screen at (WX-7, WY) and walks its
-        // own internal row counter. It appears on this line only if it's enabled (LCDC
-        // bit 5) and we've reached its top edge (LY >= WY).
-        let window_enabled = self.lcdc & 0x20 != 0;
-        if window_enabled && ly >= self.wy as usize {
-            let win_map: usize = if self.lcdc & 0x40 != 0 { 0x1C00 } else { 0x1800 };
-            let win_y = self.window_line as usize;
-            let win_start = self.wx as i16 - 7; // screen x where the window's column 0 sits
-            for x in 0..SCREEN_W {
-                if (x as i16) < win_start {
-                    continue; // this pixel is to the left of the window
-                }
-                let win_x = (x as i16 - win_start) as usize;
-                let shade = self.bg_pixel(win_map, win_x, win_y, unsigned);
-                self.framebuffer[ly * SCREEN_W + x] = shade;
-            }
-            // Advance once per line the window is shown — deliberately NOT `ly - WY`, so
-            // toggling the window mid-frame can't desync its vertical position.
-            self.window_line += 1;
-        }
+
     }
 
-    /// Fetch one background/window pixel and map it through BGP to a shade (0..=3).
+    /// Fetch one background/window pixel's COLOR INDEX (0..=3, *before* palette mapping).
     /// `(px, py)` are coordinates inside the chosen 256x256 tile-map space and `map_base`
-    /// is that map's VRAM offset (0x1800 or 0x1C00). The background and window share this
-    /// because the lookup is identical — only the coordinates and the map differ.
-    fn bg_pixel(&self, map_base: usize, px: usize, py: usize, unsigned: bool) -> u8 {
+    /// is that map's VRAM offset (0x1800 or 0x1C00). Returning the raw index (not the BGP
+    /// shade) is what lets sprite priority ask "is the BG index 0 here?". The background and
+    /// window share this because the lookup is identical — only the coords and map differ.
+    fn bg_color_id(&self, map_base: usize, px: usize, py: usize, unsigned: bool) -> u8 {
         // 1. tile number from the 32-wide map
         let tile_id = self.vram[map_base + (py / 8) * 32 + (px / 8)];
         // 2. where that tile's 16 bytes live (the signed/unsigned addressing modes)
@@ -245,9 +283,108 @@ impl Ppu {
         let hi = self.vram[data + row * 2 + 1];
         // 4. recombine the planes; bit 7 is the leftmost pixel
         let bit = 7 - (px % 8);
-        let color_id = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
-        // 5. color id -> shade through the background palette
-        (self.bgp >> (color_id * 2)) & 3
+        (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1)
+    }
+
+    /// Draw the sprites (OBJ) intersecting the current scanline, on top of the BG/window.
+    ///
+    /// === M5 HANDS-ON PIECE (Liam) ===
+    /// OAM (`self.oam`) holds 40 sprites x 4 bytes:
+    ///   byte 0: Y + 16   (screen_y = oam[0] - 16; the +16 lets sprites slide off the top)
+    ///   byte 1: X + 8    (screen_x = oam[1] - 8)
+    ///   byte 2: tile index   (in 8x16 mode the low bit is ignored: top tile = id & 0xFE)
+    ///   byte 3: flags    bit7 = priority (0 = above BG; 1 = behind BG indices 1-3)
+    ///                    bit6 = Y-flip   bit5 = X-flip   bit4 = palette (0=OBP0, 1=OBP1)
+    ///
+    /// Steps for line `ly`:
+    ///  1. height = if LCDC bit 2 set { 16 } else { 8 }.
+    ///  2. Walk OAM (0..40). A sprite covers this line if  screen_y <= ly < screen_y+height.
+    ///     screen_y can be negative (sprite partly off the top) — compute it as i16.
+    ///  3. The 10-per-line limit: keep only the FIRST 10 covering sprites (hardware cap).
+    ///  4. Sprite-vs-sprite priority (DMG): smaller X wins; ties broken by lower OAM index.
+    ///     Easiest correct trick: draw the chosen sprites from LOWEST priority to HIGHEST
+    ///     (e.g. iterate them in reverse of (x, oam_index) order) so the winner lands on top.
+    ///  5. Row within the sprite = ly - screen_y, then Y-flip if bit6: row = height-1 - row.
+    ///     Sprites ALWAYS use unsigned 0x8000 addressing — tile bytes at tile_index*16, the
+    ///     row's two bytes at +row*2 and +row*2+1 — the SAME 2bpp decode as `bg_color_id`.
+    ///  6. For each column col in 0..8: bit = if x-flip { col } else { 7 - col }; decode the
+    ///     2-bit color_id. color_id 0 = TRANSPARENT → skip (leave BG/other sprite showing).
+    ///  7. Priority: if flags bit7 is set, only draw where `bg_ids[screen_x + col] == 0`.
+    ///  8. Shade = ((if bit4 { self.obp1 } else { self.obp0 }) >> (color_id * 2)) & 3, then
+    ///     write self.framebuffer[ly * SCREEN_W + (screen_x + col)]. Bounds-check screen_x+col.
+    ///
+    /// dmg-acid2 flags each of these (flips, priority, the 10-limit, 8x16, transparency)
+    /// with a distinct visual artifact, so it's a precise per-feature debugger.
+    fn render_sprites(&mut self, ly: usize, bg_ids: &[u8; SCREEN_W]) {
+        // TODO(M5, Liam): implement OAM sprite rendering per the notes above.
+        // LCDC bit 2 sets the sprite height for the whole frame: 8x8 or 8x16
+        let height: i16 = if self.lcdc & 0x04 != 0 { 16 } else { 8 };
+
+        // which sprites cover this scanline?
+        // Hardware can fetch at most 10 sprites per line, chosen in OAM order (NOT by
+        // X). We mirror that exactly: walk 0..40, keep the first 10 whose vertical
+        // band includes `ly`. We store each chosen sprite's OAM byte-offset.
+        let mut line_sprites = [0usize; 10];
+        let mut count = 0;
+        for i in 0..40 {
+            let oam = i * 4;
+
+            let screen_y = self.oam[oam] as i16 - 16;
+            if (ly as i16) >= screen_y && (ly as i16) < screen_y + height {
+                line_sprites[count] = oam;
+                count += 1;
+                if count == 10 {
+                    break; // 10 sprites per line hardware cap}
+                }
+            }
+        }
+
+        let chosen = &mut line_sprites[..count];
+        chosen.sort_unstable_by_key(|&oam| (self.oam[oam + 1], oam));
+
+        for &oam in chosen.iter().rev(){
+            let screen_x = self.oam[oam + 1] as i16 - 8;
+            let tile = self.oam[oam + 2];
+            let flags = self.oam[oam + 3];
+            let behind_bg = flags & 0x80 != 0;
+            let y_flip = flags & 0x40 != 0;
+            let x_flip = flags & 0x20 != 0;
+            let palette = if flags & 0x10 != 0 { self.obp1 } else { self.obp0 };
+
+            let mut row = ly as i16 - (self.oam[oam] as i16 - 16);
+            if y_flip {
+                row = height - 1 - row;
+            }
+
+            let tile_index = if height == 16 { tile & 0xFE } else { tile } as usize;
+            let data = tile_index * 16 + row as usize * 2;
+            let lo = self.vram[data];
+            let hi = self.vram[data + 1];
+
+            for col in 0..8u8 {
+                let bit = if x_flip { col } else { 7 - col };
+                let color_id = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
+                if color_id == 0 {
+                    continue; // sprite color 0 is ALWAYS transparent (unlike the BG)
+                }
+
+                let px = screen_x + col as i16;
+                if px < 0 || px >= SCREEN_W as i16 {
+                    continue; // clipped off the left or right edge
+                }
+                let px = px as usize;
+
+                if behind_bg && bg_ids[px] != 0 {
+                    continue;
+                }
+
+                let shade = (palette >> (color_id * 2)) & 3;
+                self.framebuffer[ly * SCREEN_W + px] = shade;
+
+            }
+
+
+        }
     }
 
     pub fn read(&self, addr: u16) -> u8 {

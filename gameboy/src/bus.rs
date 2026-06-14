@@ -130,7 +130,18 @@ impl Bus {
             0xFF04..=0xFF07 => self.timer.write(addr, val),
             0xFF0F => self.ints.write_flag(val),
             0xFF10..=0xFF3F => self.apu_regs[(addr - 0xFF10) as usize] = val,
-            0xFF40..=0xFF4B => self.ppu.write(addr, val), // incl. 0xFF46 OAM DMA — wired in M5
+            0xFF46 => {
+                // OAM DMA. Writing XX copies the 160 bytes at 0xXX00-0xXX9F into OAM. Real
+                // hardware runs this over ~160 M-cycles with the CPU restricted to HRAM;
+                // under our instruction-stepped catch-up timing we copy it all at once,
+                // which every in-scope ROM (Tetris, dmg-acid2) is fine with.
+                let src = (val as u16) << 8;
+                for i in 0..0xA0u16 {
+                    let byte = self.read(src + i);
+                    self.ppu.oam[i as usize] = byte;
+                }
+            }
+            0xFF40..=0xFF4B => self.ppu.write(addr, val),
             0xFF50 => self.boot_rom_disabled = true,
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize] = val,
             0xFFFF => self.ints.write_enable(val),

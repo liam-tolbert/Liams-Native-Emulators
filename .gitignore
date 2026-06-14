@@ -20,5 +20,5 @@ target/
 /chip8/roms/
 /gameboy/roms/
 /gameboy/scratch/
-*.txt
+/HANDOFF.md
 /CLAUDE.md
