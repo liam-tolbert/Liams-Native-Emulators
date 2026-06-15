@@ -382,8 +382,6 @@ impl Ppu {
                 self.framebuffer[ly * SCREEN_W + px] = shade;
 
             }
-
-
         }
     }
 

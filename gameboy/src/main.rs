@@ -200,7 +200,42 @@ fn main() {
                     .update_with_buffer(&buffer, ppu::SCREEN_W, ppu::SCREEN_H)
                     .expect("failed to update window");
 
-                // (M6) sample window.is_key_down(...) into the joypad here.
+                // --- (M6) sample the keyboard into the joypad, once per frame ---
+                // Build a BTN_* bitmask (1 = pressed) from whichever host keys are down,
+                // then hand it to the bus, which forwards it to the joypad. All the
+                // hardware quirks (active-low, the 2x4 matrix, the press interrupt) live
+                // inside the joypad — out here we only report which keys are held.
+                let mut pressed = 0u8;
+                // TODO(M6): OR in each button when its key is down, e.g.
+                //   if window.is_key_down(Key::Right) { pressed |= joypad::BTN_RIGHT; }
+                // d-pad -> arrow keys; actions -> Z=A, X=B, Backspace=Select, Enter=Start
+                // (pick whatever keys feel good).
+                if window.is_key_down(Key::Right) {
+                    pressed |= joypad::BTN_RIGHT;
+                }
+                if window.is_key_down(Key::Left) {
+                    pressed |= joypad::BTN_LEFT;
+                }
+                if window.is_key_down(Key::Up) {
+                    pressed |= joypad::BTN_UP;
+                }
+                if window.is_key_down(Key::Down) {
+                    pressed |= joypad::BTN_DOWN;
+                }
+                if window.is_key_down(Key::Z) {
+                    pressed |= joypad::BTN_A;
+                }
+                if window.is_key_down(Key::X) {
+                    pressed |= joypad::BTN_B;
+                }
+                if window.is_key_down(Key::Backspace) {
+                    pressed |= joypad::BTN_SELECT;
+                }
+                if window.is_key_down(Key::Enter) {
+                    pressed |= joypad::BTN_START;
+                }
+
+                cpu.bus.set_buttons(pressed);
 
                 let elapsed = frame_start.elapsed();
                 if elapsed < frame_time {
