@@ -1,0 +1,16 @@
+[package]
+name = "psx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Same pure-Rust window + framebuffer + keyboard crate the CHIP-8 and Game Boy
+# projects use — no SDL or native-linking hassle on Windows. Not wired in until the
+# GPU exists (M4); the foundation milestones (M0-M3) are all headless.
+minifb = "0.27"
+
+# A debug build single-steps far too slowly to boot a real BIOS in reasonable time.
+# Optimise even the dev profile a little so the headless harness stays usable; the
+# release profile is what actually runs the test ROMs.
+[profile.dev]
+opt-level = 1

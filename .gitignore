@@ -20,5 +20,8 @@ target/
 /chip8/roms/
 /gameboy/roms/
 /gameboy/scratch/
+/psx/roms/
+/psx/bios/
+/psx/scratch/
 /HANDOFF.md
 /CLAUDE.md
