@@ -14,13 +14,14 @@
 use crate::interrupts::{self, Interrupts};
 
 pub struct Timer {
+    /// The 16-bit internal counter that drives everything. DIV (0xFF04) is just its
+    /// high byte; TIMA increments off the falling edge of one of its bits (see `step`).
     pub div_counter: u16,
+    /// Previous level of the TAC-selected counter bit, kept for falling-edge detection.
     pub last_signal: bool,
-    pub tima: u8,
-    pub tma: u8,
-    pub tac: u8,
-    // M3: replace the bare `div` byte with a `u16` internal counter and derive DIV
-    // from its high byte; add edge-detection state for TIMA.
+    pub tima: u8, // 0xFF05 — the counter itself
+    pub tma: u8,  // 0xFF06 — reload value on overflow
+    pub tac: u8,  // 0xFF07 — enable (bit 2) + rate select (bits 0-1)
 }
 
 impl Timer {
@@ -29,12 +30,13 @@ impl Timer {
     }
 
     /// Advance by the T-cycles the last instruction consumed (the catch-up seam).
-    pub fn step(&mut self, _t_cycles: u8, _ints: &mut Interrupts) {
-        // TODO(M3, Liam): advance the internal counter; increment TIMA on the falling
-        // edge of the TAC-selected bit; on TIMA overflow reload from TMA and
-        // `_ints.request(interrupts::TIMER)`. (The `interrupts` import is here ready
-        // for you.)
-
+    pub fn step(&mut self, _t_cycles: u8, ints: &mut Interrupts) {
+        // Step one T-cycle at a time so we never miss an edge. TIMA increments on the
+        // FALLING edge of a selected counter bit — bit 9/3/5/7 for the four TAC rates
+        // (4096 / 262144 / 65536 / 16384 Hz) — and only while the timer is enabled (TAC
+        // bit 2). When TIMA overflows 0xFF -> 0x00 it reloads from TMA and requests the
+        // TIMER interrupt. Catching the edge (not the level) is what the Blargg/Mooneye
+        // timer tests pin down.
         for _ in 0.._t_cycles {
             self.div_counter = self.div_counter.wrapping_add(1);
             let bit = [9,3,5,7][(self.tac & 0b11) as usize];
@@ -44,7 +46,7 @@ impl Timer {
                 (self.tima, overflow) = self.tima.overflowing_add(1);
                 if overflow {
                     self.tima = self.tma;
-                    _ints.request(interrupts::TIMER)
+                    ints.request(interrupts::TIMER)
                 }
             }
             self.last_signal = signal;

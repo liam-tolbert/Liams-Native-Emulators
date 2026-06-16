@@ -15,10 +15,10 @@ games.
 
 ### Game Boy (`gameboy/`)
 
-A Game Boy (DMG) emulator. Implemented so far: the Sharp LR35902 (SM83) CPU — which passes
-Blargg's `cpu_instrs` and `instr_timing` test ROMs — plus the hardware timer, interrupts,
-cartridge loading (no-MBC and basic MBC1 banking), and a scanline PPU that renders the
-background and window layers. Sprite rendering and keyboard input are in progress.
+A Game Boy (DMG) emulator that boots and plays Tetris. It implements the Sharp LR35902 (SM83)
+CPU — which passes Blargg's `cpu_instrs` and `instr_timing` test ROMs — the hardware timer and
+interrupts, cartridge loading (no-MBC and basic MBC1 banking), a scanline PPU with background,
+window, and sprite rendering (passes the dmg-acid2 test), and keyboard-driven joypad input.
 
 ## Requirements
 
@@ -69,12 +69,19 @@ alternate mode:
 
 | Argument | Mode |
 |----------|------|
-| *(none)* | open a window and run the ROM |
+| *(none)* | open a window and play the ROM |
 | `<N>`    | print a single-step CPU trace for N instructions |
 | `run`    | run headless until the ROM reports a result over the serial port |
 | `dump`   | run headless, then print an ASCII thumbnail of the rendered frame |
 
-Keyboard input is not yet implemented.
+Controls (windowed mode):
+
+| Game Boy | Keyboard |
+|----------|----------|
+| D-pad | Arrow keys |
+| A / B | Z / X |
+| Select / Start | Backspace / Enter |
+| Quit | Esc |
 
 ## ROMs
 

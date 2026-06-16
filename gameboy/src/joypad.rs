@@ -50,26 +50,40 @@ impl Joypad {
         Self { select: 0x30, buttons: 0x00 }
     }
 
-    /// Read P1/JOYP (0xFF00). Assemble the active-low register the CPU expects.
+    /// Read P1/JOYP (0xFF00) — rebuild the byte the CPU sees, from scratch, every
+    /// time. There is no stored "register value": the byte is a *view* assembled
+    /// from the select bits the CPU last wrote (`self.select`) and the live button
+    /// state (`self.buttons`). Only four lines (bits 0-3) are ever readable, so the
+    /// eight buttons take turns on them depending on which group is selected.
     pub fn read(&self) -> u8 {
-        // TODO(M6): build the active-low low nibble, then dress it up.
-        //   1. start from 0x0F (all four lines released — remember, 1 = released).
-        //   2. if the DIRECTION line is selected (select bit 4 == 0), clear the bit of
-        //      every pressed d-pad button (the low nibble of `self.buttons`).
-        //   3. if the ACTION line is selected (select bit 5 == 0), clear the bit of
-        //      every pressed action button (the high nibble of `self.buttons`, shifted
-        //      down into 0..3).
-        //   4. OR the selector bits (self.select) and the two always-1 top bits back on.
-        // todo!("M6: read() — merge select + buttons into the active-low P1 register")
-
+        // The four input lines are active-low: a *released* line reads 1, a *pressed*
+        // line reads 0. So start with all four released (0b0000_1111) and clear one
+        // bit for each button that is actually held down.
         let mut lines = 0x0F;
+
+        // The CPU "selects" a group by pulling its select bit LOW (0 = selected).
+        // Bit 4 selects the direction pad. Our d-pad buttons already sit in the low
+        // nibble of `self.buttons` at the exact positions the register uses
+        // (Right=bit0, Left=bit1, Up=bit2, Down=bit3), but with our convention
+        // "1 = pressed". `!(...)` flips each pressed bit to 0; AND-ing into `lines`
+        // clears those lines (pressed -> 0) and leaves released lines as 1.
         if self.select & 0x10 == 0 {
             lines &= !(self.buttons & 0x0F);
         }
 
+        // Bit 5 selects the action buttons. They live in the *high* nibble of
+        // `self.buttons` (A=bit4, B=bit5, Select=bit6, Start=bit7); shifting right by
+        // 4 drops them onto lines 0-3 — the same four output lines the d-pad uses.
+        // If the CPU ever selects BOTH groups at once, both AND steps run and the
+        // result is the bitwise-AND of the two groups, which is exactly what the real
+        // shared wiring does (any button held in either group pulls its line low).
         if self.select & 0x20 == 0 {
             lines &= !(self.buttons >> 4);
         }
+
+        // Assemble the full byte: bits 7-6 are unused and always read 1 (0xC0); bits
+        // 5-4 read back the select bits the CPU wrote (already masked to 0x30 in
+        // `write`); bits 3-0 are the active-low input lines we just built.
         0xC0 | self.select | (lines & 0x0F)
     }
 
@@ -83,21 +97,24 @@ impl Joypad {
     /// wire, which is what raises the Joypad interrupt — hence we take `&mut Interrupts`,
     /// exactly the way the timer/PPU are handed the interrupt line in `Bus::tick`.
     pub fn set_buttons(&mut self, pressed: u8, ints: &mut Interrupts) {
-        // TODO(M6):
-        //   1. work out which buttons are *newly* pressed this frame: set in `pressed`
-        //      AND clear in the old `self.buttons`. That release->press edge is the IRQ
-        //      trigger — holding a button must NOT keep re-firing it.
-        //   2. latch the new state: self.buttons = pressed.
-        //   3. if any newly-pressed button is on a currently-selected line, raise the
-        //      Joypad interrupt: bring `JOYPAD` into the `use` above and call
-        //      `ints.request(JOYPAD)`. (Good first cut: fire on *any* newly-pressed
-        //      button; tighten to "only on a selected line" once it works — Tetris is
-        //      happy either way.)
-        //let _ = (pressed, ints); // remove once you use them
-        //todo!("M6: set_buttons() — edge-detect a fresh press and request JOYPAD")
-
+        // Edge-detect, don't level-detect. The Joypad interrupt fires the *instant* a
+        // button goes from up to down — not once per frame it stays held. A bit is a
+        // fresh press only if it is set NOW (`pressed`) and was clear LAST frame
+        // (`!self.buttons`), so AND-ing those keeps exactly the buttons pressed this
+        // frame. (Level-detecting here would re-fire the IRQ every frame a key is held
+        // and drown the CPU in interrupts.)
         let newly_pressed = pressed & !self.buttons;
+
+        // Latch the new state: this is what `read` reports as "currently held", and it
+        // becomes "last frame" for the next call's edge comparison.
         self.buttons = pressed;
+
+        // Any fresh press raises the interrupt request bit (the CPU services it only if
+        // the Joypad interrupt is enabled). Real hardware is fussier — it only raises
+        // the IRQ for a press on a currently-*selected* line — but firing on any press
+        // is simpler and harmless: almost no game relies on this interrupt for input.
+        // Games read the buttons by polling 0xFF00 every frame; the IRQ mostly exists
+        // to wake the CPU out of the low-power STOP state.
         if newly_pressed != 0 {
             ints.request(JOYPAD);
         }

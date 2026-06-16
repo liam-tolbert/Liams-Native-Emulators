@@ -1,16 +1,11 @@
 //! Host shell for the Game Boy (DMG) emulator.
 //!
 //! Everything that isn't the emulated machine lives here — the same role
-//! `chip8/src/main.rs` played for CHIP-8. Right now (milestone M0) the shell only
-//! loads a ROM and prints its cartridge header. The minifb window, the keyboard
-//! mapping, and the ~60 Hz frame loop arrive once there's a CPU and a PPU to drive
-//! them (M4/M6).
-
-// Scaffold-in-progress: subsystems are filled in milestone by milestone, so many
-// struct fields and methods are defined before their first caller exists. This keeps
-// the build warning-free while we grow into the scaffold; remove it near M6 once the
-// emulator is feature-complete and every field is actually used.
-#![allow(dead_code)]
+//! `chip8/src/main.rs` played for CHIP-8. It loads a ROM, prints the cartridge
+//! header, then dispatches on an optional 2nd arg: no arg opens the minifb window
+//! and plays the ROM (the ~60 Hz frame loop plus keyboard -> joypad input); `<N>`
+//! single-steps with a register trace; `run` drives the Blargg serial harness;
+//! `dump` renders headlessly to an ASCII thumbnail.
 
 mod bus;
 mod cartridge;
@@ -157,8 +152,8 @@ fn main() {
 
         // --- Windowed run (no 2nd arg): open a window and play the ROM ------------------
         // Run the CPU until the PPU signals a finished frame, blit the framebuffer, hold
-        // ~59.7 Hz. Keyboard -> joypad wiring arrives in M6; until then a game boots to its
-        // title/attract screen but can't be controlled.
+        // ~59.7 Hz, and sample the keyboard into the joypad once per frame (below). This is
+        // the playable path: Tetris boots to its title screen and responds to the controls.
         None => {
             const SHADES: [u32; 4] = [0x00FF_FFFF, 0x00AA_AAAA, 0x0055_5555, 0x0000_0000];
             let mut cpu = Cpu::new(bus);
@@ -206,10 +201,8 @@ fn main() {
                 // hardware quirks (active-low, the 2x4 matrix, the press interrupt) live
                 // inside the joypad — out here we only report which keys are held.
                 let mut pressed = 0u8;
-                // TODO(M6): OR in each button when its key is down, e.g.
-                //   if window.is_key_down(Key::Right) { pressed |= joypad::BTN_RIGHT; }
-                // d-pad -> arrow keys; actions -> Z=A, X=B, Backspace=Select, Enter=Start
-                // (pick whatever keys feel good).
+                // d-pad -> arrow keys; A=Z, B=X, Select=Backspace, Start=Enter. One OR per
+                // held key assembles the BTN_* bitmask the joypad expects.
                 if window.is_key_down(Key::Right) {
                     pressed |= joypad::BTN_RIGHT;
                 }

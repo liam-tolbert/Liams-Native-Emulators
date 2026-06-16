@@ -79,7 +79,7 @@ impl Ppu {
     /// line (0-143) runs OAM-scan (mode 2, 80 dots) -> drawing (mode 3, 172 dots) -> HBlank
     /// (mode 0, the rest); lines 144-153 are VBlank (mode 1). We emit a line's pixels the
     /// moment it enters HBlank, and raise the VBlank interrupt + set `frame_ready` when LY
-    /// first reaches 144. (STAT-interrupt edge logic is M5.)
+    /// first reaches 144. (STAT-interrupt edges are handled in `refresh_stat_line`.)
     pub fn step(&mut self, t_cycles: u8, ints: &mut Interrupts) {
         // LCD disabled (LCDC bit 7 = 0): the PPU is halted — LY reads 0, no modes, no
         // interrupts, no rendering. Games briefly do this to get free VRAM access.
@@ -170,36 +170,32 @@ impl Ppu {
 
     /// Render the current scanline (`self.ly`) of the background into `framebuffer`.
     ///
-    /// ┌─ M4 HANDS-ON PIECE (Liam) ───────────────────────────────────────────────────┐
-    /// │ This is the per-scanline background tile fetch — the visual payoff of M4. With │
-    /// │ an empty body the screen stays blank; fill it in and Tetris's title/playfield  │
-    /// │ appears. Index `self.vram` from 0 (its addresses are 0x8000-based, so a VRAM   │
-    /// │ *offset* = address - 0x8000).                                                  │
-    /// │                                                                                │
-    /// │ For each pixel x in 0..SCREEN_W, at line `self.ly`:                            │
-    /// │  1. Scroll. The BG is a 256x256 space that WRAPS:                              │
-    /// │       bg_y = (self.ly as u16 + self.scy as u16) & 0xFF                         │
-    /// │       bg_x = (x as u16 + self.scx as u16) & 0xFF                               │
-    /// │  2. Tile map (which 32x32 map of tile indices). LCDC bit 3 selects the base:   │
-    /// │       0 -> VRAM offset 0x1800 (0x9800),  1 -> 0x1C00 (0x9C00)                  │
-    /// │       tile_id = vram[map_base + (bg_y/8)*32 + (bg_x/8)]                        │
-    /// │  3. Tile DATA address — THE classic gotcha, signed vs unsigned. LCDC bit 4:    │
-    /// │       1 -> base 0x0000, tile_id is UNSIGNED:  data = tile_id*16               │
-    /// │       0 -> base 0x1000, tile_id is SIGNED:    data = 0x1000 + (tile_id as i8 │
-    /// │                                                            as i16)*16          │
-    /// │     Each tile = 16 bytes = 8 rows x 2 bytes (2 bits per pixel = "2bpp").       │
-    /// │  4. Decode the 2bpp pixel. row = bg_y % 8; that row is two bytes:              │
-    /// │       lo = vram[data + row*2]      hi = vram[data + row*2 + 1]                 │
-    /// │     Bit 7 is the LEFTMOST pixel, so:  bit = 7 - (bg_x % 8)                     │
-    /// │       color_id = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1)   // 0..3        │
-    /// │  5. Palette. The 4 entries of BGP map a color_id to a shade:                   │
-    /// │       shade = (self.bgp >> (color_id * 2)) & 0b11                              │
-    /// │  6. Store: framebuffer[self.ly as usize * SCREEN_W + x] = shade                │
-    /// │                                                                                │
-    /// │ Do the background first — that's the checkpoint. The window layer (LCDC bit 5, │
-    /// │ positioned at WX-7 / WY, reusing steps 2-5 against the window map) is the      │
-    /// │ follow-on once the background is on screen.                                    │
-    /// └────────────────────────────────────────────────────────────────────────────────┘
+    /// The per-scanline background tile fetch. The steps below map one-to-one onto the
+    /// code in this method and `bg_color_id`. VRAM is indexed from 0, but its hardware
+    /// addresses are 0x8000-based, so a VRAM *offset* = address - 0x8000.
+    ///
+    /// For each pixel x in 0..SCREEN_W, at line `self.ly`:
+    ///  1. Scroll. The BG is a 256x256 space that WRAPS:
+    ///       bg_y = (self.ly + self.scy) & 0xFF
+    ///       bg_x = (x       + self.scx) & 0xFF
+    ///  2. Tile map (which 32x32 map of tile indices). LCDC bit 3 selects the base:
+    ///       0 -> VRAM offset 0x1800 (0x9800),  1 -> 0x1C00 (0x9C00)
+    ///       tile_id = vram[map_base + (bg_y/8)*32 + (bg_x/8)]
+    ///  3. Tile DATA address — THE classic gotcha, signed vs unsigned. LCDC bit 4:
+    ///       1 -> base 0x0000, tile_id is UNSIGNED:  data = tile_id*16
+    ///       0 -> base 0x1000, tile_id is SIGNED:    data = 0x1000 + (tile_id as i8 as i16)*16
+    ///     Each tile = 16 bytes = 8 rows x 2 bytes (2 bits per pixel = "2bpp").
+    ///  4. Decode the 2bpp pixel. row = bg_y % 8; that row is two bytes:
+    ///       lo = vram[data + row*2]      hi = vram[data + row*2 + 1]
+    ///     Bit 7 is the LEFTMOST pixel, so:  bit = 7 - (bg_x % 8)
+    ///       color_id = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1)   // 0..3
+    ///  5. Palette. The 4 entries of BGP map a color_id to a shade:
+    ///       shade = (self.bgp >> (color_id * 2)) & 0b11
+    ///  6. Store: framebuffer[self.ly * SCREEN_W + x] = shade
+    ///
+    /// The window layer (LCDC bit 5, positioned at WX-7 / WY) reuses steps 2-5 against
+    /// the window map and is drawn over the background; the shared lookup lives in
+    /// `bg_color_id`.
     fn render_scanline(&mut self) {
         let ly = self.ly as usize;
         // The BG/window color INDEX (0..3, pre-palette) at each pixel of this line. Sprites
@@ -288,7 +284,7 @@ impl Ppu {
 
     /// Draw the sprites (OBJ) intersecting the current scanline, on top of the BG/window.
     ///
-    /// === M5 HANDS-ON PIECE (Liam) ===
+    /// How it works (the steps below map onto the code in this method):
     /// OAM (`self.oam`) holds 40 sprites x 4 bytes:
     ///   byte 0: Y + 16   (screen_y = oam[0] - 16; the +16 lets sprites slide off the top)
     ///   byte 1: X + 8    (screen_x = oam[1] - 8)
@@ -316,8 +312,7 @@ impl Ppu {
     /// dmg-acid2 flags each of these (flips, priority, the 10-limit, 8x16, transparency)
     /// with a distinct visual artifact, so it's a precise per-feature debugger.
     fn render_sprites(&mut self, ly: usize, bg_ids: &[u8; SCREEN_W]) {
-        // TODO(M5, Liam): implement OAM sprite rendering per the notes above.
-        // LCDC bit 2 sets the sprite height for the whole frame: 8x8 or 8x16
+        // LCDC bit 2 sets the sprite height for the whole frame: 8x8 or 8x16.
         let height: i16 = if self.lcdc & 0x04 != 0 { 16 } else { 8 };
 
         // which sprites cover this scanline?
@@ -334,7 +329,7 @@ impl Ppu {
                 line_sprites[count] = oam;
                 count += 1;
                 if count == 10 {
-                    break; // 10 sprites per line hardware cap}
+                    break; // 10 sprites per line — hardware cap
                 }
             }
         }
