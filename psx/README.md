@@ -4,17 +4,19 @@ A from-scratch PlayStation 1 (MIPS R3000A) emulator in Rust — the third and mo
 emulator in this collection, and the current focus. It is built clean-room from primary
 hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) and test ROMs.
 
-> **Status: M0 — scaffold.** The crate builds and the machine wiring (bus → CPU, the CPU
-> owning the bus) is in place. The MIPS interpreter, memory map, and test harness are the
-> next milestones. See the milestone roadmap below.
+> **Status: M1 — CPU core.** The MIPS R3000A interpreter is implemented: the full integer
+> instruction set, the branch- and load-delay slots, and a minimal exception-entry path
+> (pulled forward from M2 so SYSCALL/BREAK/overflow/COP0 moves work). It single-steps the real
+> BIOS reset sequence divergence-free and passes a built-in, ROM-free CPU self-test. The full
+> exception/COP0 plumbing (M2) and the BIOS-boot TTY harness (M3) are next.
 
 ## Roadmap
 
 | Milestone | Scope | State |
 |-----------|-------|-------|
 | **M0** | Crate scaffold: module layout, run-mode skeleton, reset wiring | **done** |
-| **M1** | MIPS R3000A interpreter (branch- & load-delay slots, the full integer set) | next |
-| **M2** | Memory map + MMIO + exceptions / COP0 | |
+| **M1** | MIPS R3000A interpreter (branch- & load-delay slots, the full integer set) | **done** |
+| **M2** | Memory map + MMIO + exceptions / COP0 | next |
 | **M3** | BIOS boot + PS-EXE sideload + headless TTY harness → pass the CPU test ROMs | |
 | M4 | GPU: VRAM, GP0/GP1 FIFO, software rasterizer → first rendered frame | later |
 | M5+ | GTE, CD-ROM, SPU audio, controllers, then a dynamic recompiler (JIT) | later |
@@ -44,6 +46,7 @@ cargo run --release -- <bios.bin> [mode]
 |----------|------|-----------|
 | `<bios.bin>` | boot the BIOS headless, echoing kernel TTY | M3 |
 | `<bios.bin> <N>` | single-step `N` instructions with a register trace | M1 |
+| `selftest` | run the built-in, ROM-free CPU self-test | M1 |
 | `<bios.bin> <game.exe>` | sideload a PS-EXE and run until it prints a pass/fail verdict | M3 |
 | `<bios.bin> dump` | run headless, then print an ASCII thumbnail of the frame | M4 |
 

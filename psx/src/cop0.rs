@@ -94,6 +94,61 @@ impl Cop0 {
         }
     }
 
+    // ----- taking and returning from an exception -------------------------------------
+    //
+    // When the CPU hits something it can't handle inline (a SYSCALL, an overflow, an
+    // enabled interrupt...), it "takes an exception": it stops, records *why* and *where*,
+    // disables interrupts, and jumps to a fixed handler address in the BIOS. COP0 holds all
+    // the bookkeeping for that, so the entry/exit logic lives here.
+
+    /// Take an exception. Records the cause and return address, pushes the interrupt-enable /
+    /// mode stack, and returns the **handler address** the CPU should jump to.
+    ///
+    /// `pc` is the address of the instruction that faulted; `in_delay_slot` is true when that
+    /// instruction was sitting in a branch's delay slot (the slot right after a branch, which
+    /// always runs — see the CPU core for why).
+    pub fn enter_exception(&mut self, exc: Exception, pc: u32, in_delay_slot: bool) -> u32 {
+        // SR's low 6 bits are a tiny 3-deep stack of (kernel-mode, interrupt-enable) pairs:
+        //   bits 1..0 = "current", bits 3..2 = "previous", bits 5..4 = "old".
+        // Taking an exception pushes that stack up by one pair and sets the new "current" pair
+        // to 0 — i.e. interrupts off and kernel mode — so the handler runs uninterrupted. The
+        // oldest pair (bits 5..4) just falls off the top.
+        let stack = self.sr & 0x3F;
+        self.sr = (self.sr & !0x3F) | ((stack << 2) & 0x3F);
+
+        // CAUSE.ExcCode (bits 6..2) tells the handler *what* happened; it reads this to decide
+        // how to respond. We overwrite just those 5 bits.
+        self.cause = (self.cause & !0x0000_007C) | ((exc as u32) << 2);
+
+        // CAUSE.BD (bit 31, "branch delay") records whether the faulting instruction was in a
+        // delay slot. If it was, the address we must resume at is the *branch*, not the slot —
+        // re-running the branch re-runs the slot too — so EPC points one instruction earlier.
+        if in_delay_slot {
+            self.cause |= 1 << 31;
+            self.epc = pc.wrapping_sub(4);
+        } else {
+            self.cause &= !(1 << 31);
+            self.epc = pc;
+        }
+
+        // BEV (SR bit 22) selects which copy of the exception vectors to use. At reset it's 1,
+        // pointing at the ROM vectors in the BIOS; the kernel later clears it to use the RAM
+        // copies it installs. (General exceptions sit at +0x80 within each vector page.)
+        if self.boot_exception_vectors() {
+            0xBFC0_0180
+        } else {
+            0x8000_0080
+        }
+    }
+
+    /// `RFE` (restore-from-exception) — the tail of a handler. Pops the SR mode stack so the
+    /// interrupted code's interrupt-enable / mode bits come back: "previous" -> "current" and
+    /// "old" -> "previous". (The hardware leaves the "old" pair as-is.)
+    pub fn return_from_exception(&mut self) {
+        let stack = self.sr & 0x3F;
+        self.sr = (self.sr & !0x0F) | (stack >> 2);
+    }
+
     /// `MFC0 rt, rd` reads a COP0 register.
     pub fn read(&self, rd: usize) -> u32 {
         match rd {
