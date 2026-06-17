@@ -4,11 +4,13 @@ A from-scratch PlayStation 1 (MIPS R3000A) emulator in Rust — the third and mo
 emulator in this collection, and the current focus. It is built clean-room from primary
 hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) and test ROMs.
 
-> **Status: M1 — CPU core.** The MIPS R3000A interpreter is implemented: the full integer
-> instruction set, the branch- and load-delay slots, and a minimal exception-entry path
-> (pulled forward from M2 so SYSCALL/BREAK/overflow/COP0 moves work). It single-steps the real
-> BIOS reset sequence divergence-free and passes a built-in, ROM-free CPU self-test. The full
-> exception/COP0 plumbing (M2) and the BIOS-boot TTY harness (M3) are next.
+> **Status: M2 — memory map, MMIO & exceptions.** On top of the M1 CPU core, the bus is
+> complete (segment-masked memory map, the `0x1F801xxx` I/O block, byte/half/word access) and
+> the exception/COP0 unit is now exercised end-to-end: misaligned-load/store address errors, the
+> full interrupt-delivery chain (a source raises `I_STAT` → masked by `I_MASK` → COP0 `Cause.IP2`
+> → gated by `SR.IEc`/`SR.IM` → the `Interrupt` exception → `RFE`), the SR mode/IRQ stack, and
+> cache-isolation. All of it is gated by the built-in, ROM-free `selftest`. The BIOS-boot TTY
+> harness (M3) is next.
 
 ## Roadmap
 
@@ -16,8 +18,8 @@ hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) 
 |-----------|-------|-------|
 | **M0** | Crate scaffold: module layout, run-mode skeleton, reset wiring | **done** |
 | **M1** | MIPS R3000A interpreter (branch- & load-delay slots, the full integer set) | **done** |
-| **M2** | Memory map + MMIO + exceptions / COP0 | next |
-| **M3** | BIOS boot + PS-EXE sideload + headless TTY harness → pass the CPU test ROMs | |
+| **M2** | Memory map + MMIO + exceptions / COP0 | **done** |
+| **M3** | BIOS boot + PS-EXE sideload + headless TTY harness → pass the CPU test ROMs | next |
 | M4 | GPU: VRAM, GP0/GP1 FIFO, software rasterizer → first rendered frame | later |
 | M5+ | GTE, CD-ROM, SPU audio, controllers, then a dynamic recompiler (JIT) | later |
 

@@ -118,8 +118,14 @@ impl Cpu {
         self.branch = false; // the instruction we run now may set it again
 
         // The IRQ controller aggregates every interrupt source onto one line; mirror that line
-        // into COP0's Cause.IP2 so the pending-interrupt test below can see it. (Nothing raises
-        // an interrupt yet in M1, so this stays low, but the wiring is real.)
+        // into COP0's Cause.IP2 so the pending-interrupt test below can see it.
+        //
+        // Note the TWO independent masks an interrupt must clear, and that they live in different
+        // places on purpose: `Irq::pending()` ANDs I_STAT with I_MASK (the *controller* decides
+        // which sources are allowed to pull the line at all), and `interrupt_pending()` then ANDs
+        // Cause.IP against SR.IM (the *CPU* decides whether it is listening to line IP2). A real
+        // interrupt has to survive both. (M1 had no caller for `Irq::raise`, so this line stayed
+        // low; the M2 self-test now drives the whole chain end-to-end.)
         self.cop0.set_hw_irq(self.bus.irq.pending());
 
         if self.cop0.irq_enabled() && self.cop0.interrupt_pending() {

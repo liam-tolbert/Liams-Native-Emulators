@@ -212,6 +212,13 @@ impl Bus {
     // ===== Hardware I/O registers (0x1F801000-0x1F801FFF) ===============================
     // Only the registers the BIOS prods during early boot are real; the rest are stubbed so
     // a poll loop sees a sane value and moves on. Each gets fleshed out in its own milestone.
+    //
+    // DOCUMENTED GAP (M2): `width` is currently ignored — every register is treated as a plain
+    // 32-bit word, and the CPU's load opcode does any byte/half narrowing on the value we return.
+    // A few real registers behave differently per access width (e.g. byte vs. word reads of some
+    // device ports), and I_STAT/I_MASK are physically 16-bit so their upper half reads back 0
+    // here rather than whatever the hardware floats. None of that matters to the BIOS boot or the
+    // amidog CPU tests, so it's deferred until a test ROM actually depends on it.
     fn io_read(&self, offset: u32, _width: u8) -> u32 {
         match offset {
             0x000..=0x05F => self.mem_control[(offset >> 2) as usize], // memory-control 1
