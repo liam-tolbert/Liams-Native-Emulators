@@ -156,7 +156,10 @@ impl Chip8 {
             0x8000 => self.exec_arithmetic(x, y, n),                // 8XY_: register ALU ops
             0x9000 => if self.v[x] != self.v[y] { self.pc += 2 },   // 9XY0: skip if VX != VY
             0xA000 => self.i = nnn,                                 // ANNN: I = NNN
-            0xB000 => self.pc = nnn + self.v[0] as u16,             // BNNN: jump to NNN + V0
+            // BNNN: jump to NNN + V0. (Quirk: SUPER-CHIP reinterpreted this as BXNN — jump to
+            // XNN + VX, using the register named by the high nibble. We use the original COSMAC
+            // VIP behaviour, NNN + V0, which is what the classic ROMs expect.)
+            0xB000 => self.pc = nnn + self.v[0] as u16,
             0xC000 => self.v[x] = self.rand_byte() & nn,            // CXNN: VX = random & NN
             0xD000 => self.draw_sprite(x, y, n),                    // DXYN: draw sprite
             0xE000 => match nn {

@@ -26,6 +26,9 @@ pub struct Timer {
 
 impl Timer {
     pub fn new() -> Self {
+        // Post-boot state (we HLE the boot ROM, so we start where it would leave us). TAC reads
+        // back as 0xF8 — its three real bits clear, so the timer starts disabled at the slowest
+        // rate; the unused top 5 bits always read 1. Everything else starts zeroed.
         Self { div_counter: 0, last_signal: false, tima: 0, tma: 0, tac: 0xF8 }
     }
 
