@@ -78,6 +78,18 @@ impl Cop0 {
     pub fn boot_exception_vectors(&self) -> bool {
         self.sr & 0x0040_0000 != 0
     }
+    /// Is coprocessor `n` (0..3) usable right now? Each coprocessor has an "enable" flag in SR —
+    /// the CU bits, bits 31..28 = CU3..CU0 — and software must set it before using that coprocessor
+    /// or the access faults with "coprocessor unusable". COP0 is the exception to the rule: it is
+    /// *also* always usable while the CPU is in kernel mode (SR.KUc, bit 1, == 0). That's how the
+    /// BIOS runs its exception handlers — which are full of COP0 moves — without ever bothering to
+    /// set CU0. Honouring this gate (instead of always faulting) is exactly what the cpu/cop test
+    /// ROM checks: an *enabled* coprocessor must NOT throw.
+    pub fn cop_usable(&self, n: u32) -> bool {
+        let cu_set = self.sr & (1 << (28 + n)) != 0;
+        let kernel_mode = self.sr & (1 << 1) == 0;
+        cu_set || (n == 0 && kernel_mode)
+    }
     /// The interrupt mask (IM, bits 15..8) ANDed against the pending bits (IP) tells us
     /// whether any *enabled* interrupt is waiting.
     pub fn interrupt_pending(&self) -> bool {
@@ -92,6 +104,14 @@ impl Cop0 {
         } else {
             self.cause &= !(1 << 10);
         }
+    }
+
+    /// Record which coprocessor (0..3) triggered a Coprocessor Unusable exception, in Cause.CE (the
+    /// "coprocessor error" field, bits 29..28). The kernel's handler reads it to learn which
+    /// coprocessor the faulting instruction was for. (`enter_exception` only rewrites the ExcCode
+    /// and BD fields, so a CE set here survives into the handler.)
+    pub fn set_coprocessor_error(&mut self, n: u32) {
+        self.cause = (self.cause & !0x3000_0000) | ((n & 3) << 28);
     }
 
     // ----- taking and returning from an exception -------------------------------------

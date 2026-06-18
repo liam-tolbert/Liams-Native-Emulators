@@ -63,6 +63,12 @@ pub struct Cpu {
 
     pub cop0: Cop0, // COP0 is part of the CPU, so the CPU owns it (unlike the DMG's bus-owned IRQs)
 
+    /// When true, snoop BIOS `std_out_putchar` calls and copy the character into the captured TTY
+    /// stream — the hook that lets the headless M3 harness read whatever a booting BIOS or a
+    /// sideloaded test program prints. Left off for the `selftest` (whose tiny hand-written programs
+    /// never call the BIOS), so the tap costs nothing there. See the snoop in `step()`.
+    pub capture_tty: bool,
+
     /// The CPU owns the bus; every memory access goes through it.
     pub bus: Bus,
 }
@@ -84,6 +90,7 @@ impl Cpu {
             lo: 0,
             cycles: 0,
             cop0: Cop0::new(),
+            capture_tty: false,
             bus,
         }
     }
@@ -116,6 +123,33 @@ impl Cpu {
         self.current_pc = self.pc;
         self.delay_slot = self.branch;
         self.branch = false; // the instruction we run now may set it again
+
+        // ---- BIOS TTY tap (M3) ---------------------------------------------------------------
+        // How does a PS1 program print text? There's no console by default, but the BIOS provides a
+        // "kernel TTY" (a debug serial terminal) plus a putchar routine to write to it. The catch:
+        // the PS1 kernel does NOT expose its functions as numbered SYSCALLs. Instead it publishes
+        // three jump tables — "A", "B", "C" — at the *fixed* addresses 0xA0, 0xB0, 0xC0. To call
+        // function N of table B you put N in register $t1 (r9) and `jal 0xB0`; a stub there indexes
+        // the table and jumps to the real routine. Arguments use the normal MIPS convention, so the
+        // first one sits in $a0 (r4).
+        //
+        // Those fixed addresses are a gift to a headless emulator: to capture everything the machine
+        // prints we needn't emulate any serial hardware — we just watch for the CPU about to execute
+        // a vector entry and read the arguments straight off the registers. `std_out_putchar` is
+        // function 0x3C of table A (0xA0 with $t1 == 0x3C) and 0x3D of table B (0xB0 with $t1 ==
+        // 0x3D); the character to print is the low byte of $a0. This is the same idea the Game Boy
+        // build used to scrape Blargg's pass/fail text off the serial port.
+        //
+        // We only *observe* — control flow is untouched — so the real BIOS routine still runs
+        // underneath (it writes the byte to the stubbed debug port, harmlessly). We mask the address
+        // to its physical form (`& 0x1FFF_FFFF`) so the tap fires regardless of which KUSEG/KSEG0/
+        // KSEG1 mirror window the caller jumped through (they all alias the same low addresses).
+        if self.capture_tty {
+            match (self.current_pc & 0x1FFF_FFFF, self.regs[9]) {
+                (0xA0, 0x3C) | (0xB0, 0x3D) => self.bus.tty_push(self.regs[4] as u8),
+                _ => {}
+            }
+        }
 
         // The IRQ controller aggregates every interrupt source onto one line; mirror that line
         // into COP0's Cause.IP2 so the pending-interrupt test below can see it.
@@ -176,6 +210,30 @@ impl Cpu {
         // The jump to the handler is not a delayed branch, so the handler's first instruction
         // must not be treated as a delay slot.
         self.branch = false;
+    }
+
+    /// A COPn / LWCn / SWCn op for coprocessor `n`. If software has marked the coprocessor usable
+    /// (its SR.CU bit, or kernel mode for COP0), we accept it — there's nothing to do yet for the
+    /// absent COP1/COP3, and the GTE's (COP2) data moves arrive in M5 — otherwise it raises
+    /// Coprocessor Unusable. Gating on the usable bit, rather than always faulting, is what makes
+    /// cpu/cop's "enabled" cases pass.
+    fn cop_op(&mut self, n: u32) {
+        // These are gated purely by the SR.CU "usable" bit. Unlike the COP0 *control* ops
+        // (MFC0/MTC0/RFE in the 0x10 arm), the load/store-coprocessor forms do NOT inherit COP0's
+        // kernel-mode exemption — cpu/cop's testSwc0Disabled shows SWC0 faulting in kernel mode when
+        // CU0 is clear, even though a kernel-mode MFC0 right next to it would not. When the bit is
+        // set there's nothing to do yet (no FPU; the GTE's COP2 moves arrive in M5); when it's clear
+        // it's Coprocessor Unusable.
+        if self.cop0.sr & (1 << (28 + n)) == 0 {
+            self.cop_unusable(n);
+        }
+    }
+
+    /// Raise a Coprocessor Unusable exception, first recording which coprocessor (0..3) was at
+    /// fault in Cause.CE so the kernel's handler can tell which one was poked.
+    fn cop_unusable(&mut self, n: u32) {
+        self.cop0.set_coprocessor_error(n);
+        self.exception(Exception::CoprocessorUnusable);
     }
 
     // ===== stores (gated by cache isolation) ============================================
@@ -411,20 +469,27 @@ impl Cpu {
             0x0E => self.set_reg(rt, self.reg(rs) ^ imm16), // XORI
             0x0F => self.set_reg(rt, imm16 << 16),          // LUI — load upper immediate
 
-            // ---- COP0: system control coprocessor moves ----
-            0x10 => match rs {
-                0x00 => {
-                    // MFC0 rt, rd — move *from* COP0. Like a memory load it has a delay slot, so
-                    // it parks its value in `load` rather than writing rt immediately.
-                    self.load = (rt, self.cop0.read(rd));
+            // ---- COP0: the system control coprocessor ----
+            // The usability gate comes first (see `Cop0::cop_usable`): if COP0 isn't usable in the
+            // current mode the whole instruction faults before we even decode it. Once it IS usable
+            // we decode the move — and crucially, an *unrecognised* COP0 op is a silent NOP, not a
+            // fault (real hardware just ignores it; cpu/cop's testCop0InvalidOpcode pins this down).
+            0x10 => {
+                if !self.cop0.cop_usable(0) {
+                    self.cop_unusable(0);
+                } else {
+                    match rs {
+                        0x00 => {
+                            // MFC0 rt, rd — move *from* COP0. Like a memory load it has a delay
+                            // slot, so it parks its value in `load` rather than writing rt now.
+                            self.load = (rt, self.cop0.read(rd));
+                        }
+                        0x04 => self.cop0.write(rd, self.reg(rt)), // MTC0 — move *to* COP0
+                        0x10..=0x1F if funct == 0x10 => self.cop0.return_from_exception(), // RFE
+                        _ => {} // CFC0/CTC0 and any other COP0 op: a NOP on the PS1, not a fault
+                    }
                 }
-                0x04 => self.cop0.write(rd, self.reg(rt)), // MTC0 rt, rd — move *to* COP0 (immediate)
-                0x10..=0x1F => match funct {
-                    0x10 => self.cop0.return_from_exception(), // RFE — pop the exception stack
-                    _ => self.exception(Exception::ReservedInstr),
-                },
-                _ => self.exception(Exception::ReservedInstr),
-            },
+            }
 
             // ---- loads (I-type). Each parks its result in the load-delay slot. ----
             0x20 => {
@@ -558,13 +623,24 @@ impl Cpu {
                 self.store32(aligned_addr, merged);
             }
 
-            // ---- coprocessors we don't implement yet ----
-            // COP1 (FPU, absent on the PS1), COP2 (the GTE — arrives in M5), COP3 (absent), and
-            // the coprocessor load/store forms. Until the GTE exists, exercising one is a
-            // "coprocessor unusable" exception.
-            0x11 | 0x12 | 0x13 | 0x30 | 0x31 | 0x32 | 0x33 | 0x38 | 0x39 | 0x3A | 0x3B => {
-                self.exception(Exception::CoprocessorUnusable);
-            }
+            // ---- the other coprocessors: COP1/COP2/COP3 and their load/store forms ----
+            // The PS1 has no COP1 (FPU) or COP3, and COP2 is the GTE (the geometry engine — arrives
+            // in M5). Whether one of these faults depends ONLY on the matching SR.CUn "usable" bit,
+            // not on whether we've implemented it: if software enabled the coprocessor the op is
+            // accepted (and, for now, does nothing); if not, it raises Coprocessor Unusable. The low
+            // nibble of the primary opcode is the coprocessor number — COPn = 0x10+n, LWCn = 0x30+n,
+            // SWCn = 0x38+n — so map each to its number and let `cop_op` apply the gate.
+            0x11 => self.cop_op(1),
+            0x12 => self.cop_op(2),
+            0x13 => self.cop_op(3),
+            0x30 => self.cop_op(0), // LWC0
+            0x31 => self.cop_op(1), // LWC1
+            0x32 => self.cop_op(2), // LWC2 (GTE)
+            0x33 => self.cop_op(3), // LWC3
+            0x38 => self.cop_op(0), // SWC0
+            0x39 => self.cop_op(1), // SWC1
+            0x3A => self.cop_op(2), // SWC2 (GTE)
+            0x3B => self.cop_op(3), // SWC3
 
             _ => self.exception(Exception::ReservedInstr), // unknown primary opcode
         }

@@ -113,10 +113,15 @@ fn main() {
             println!("\n[GPU frame thumbnail] — arrives with the M4 GPU.");
         }
         Some(other) => {
-            println!("\n[PS-EXE sideload + TTY harness for '{other}'] — arrives in M3.");
+            run_sideload(&mut cpu, other);
         }
         None => {
-            println!("\n[headless BIOS boot] — arrives in M3.");
+            if cpu.bus.bios_loaded() {
+                run_bios_boot(&mut cpu);
+            } else {
+                eprintln!("\n(no BIOS loaded — supply a 512 KiB BIOS image to boot)");
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -163,6 +168,240 @@ fn dump_regs(cpu: &Cpu) {
         "    hi=0x{:08X} lo=0x{:08X}  next_pc=0x{:08X}\n",
         cpu.hi, cpu.lo, cpu.next_pc
     );
+}
+
+// ===== BIOS boot / PS-EXE sideload harness (M3) =========================================
+//
+// A real PS1 boots like this: the CPU starts executing the BIOS ROM at 0xBFC00000; the BIOS sets
+// up the kernel (exception handlers, the A0/B0/C0 function tables, a stack, the controllers...),
+// shows the splash screen, then reads the game's boot executable off the CD into RAM and jumps to
+// it at the fixed address 0x80030000.
+//
+// We don't emulate the CD-ROM yet, so we "sideload": let the *real* BIOS boot all the way to that
+// 0x80030000 hand-off, then — in place of code read from a disc — drop a PS-EXE we already have on
+// the host into RAM and jump into it ourselves. Booting the real BIOS first (rather than faking a
+// minimal environment) is what gives the program everything it expects: the kernel function tables
+// it will call for I/O, and a valid, kernel-initialized stack pointer. So 0x80030000 does double
+// duty here — it is both the "BIOS finished booting" success marker and the exact instant we inject.
+
+/// The address the BIOS jumps to when it hands control to the disc's boot executable — and so the
+/// point where we inject instead. (psx-spx: this is where the shell execs the loaded PSX.EXE.)
+const EXEC_POINT: u32 = 0x8003_0000;
+
+/// Generous instruction budget for the real BIOS boot (it runs into the millions before the
+/// hand-off). If a BIOS needs more, bump this; if the boot *stalls*, the budget is what turns an
+/// infinite wait into a "pause and report".
+const BOOT_BUDGET: u64 = 50_000_000;
+
+/// Step the CPU until PC reaches `target`, or until `budget` instructions have run. Returns the
+/// instruction count on success, or `None` if the budget ran out first. The check is at the top of
+/// the loop, so on success the CPU is poised *at* `target` (it hasn't executed it yet) — which is
+/// exactly the moment the sideloader wants, to overwrite PC with the EXE's entry point.
+fn run_until_pc(cpu: &mut Cpu, target: u32, budget: u64) -> Option<u64> {
+    for i in 0..budget {
+        if cpu.pc == target {
+            return Some(i);
+        }
+        cpu.step();
+    }
+    None
+}
+
+/// Headless BIOS boot: run the real BIOS with TTY capture on until it reaches the executable
+/// hand-off point. Reaching it is the boot-success signal — many BIOS revisions print little or
+/// nothing over the kernel TTY during boot (it's mostly used by games), so "no TTY" is not failure.
+fn run_bios_boot(cpu: &mut Cpu) {
+    cpu.capture_tty = true;
+    println!("\n[headless BIOS boot] running until exec point 0x{EXEC_POINT:08X} ...\n");
+    match run_until_pc(cpu, EXEC_POINT, BOOT_BUDGET) {
+        Some(n) => {
+            println!("\n\n[BIOS] reached 0x{EXEC_POINT:08X} after {n} instructions — boot OK.");
+            println!("[BIOS] the kernel is ready to hand control to a program.");
+        }
+        None => {
+            // The agreed contingency: if the boot stalls, stop and report where, rather than
+            // sinking time into boot debugging unprompted.
+            eprintln!(
+                "\n\n[BIOS] did NOT reach 0x{EXEC_POINT:08X} within {BOOT_BUDGET} instructions \
+                 — it stalled. Last CPU state:"
+            );
+            dump_regs(cpu);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ----- PS-EXE sideload ------------------------------------------------------------------
+
+/// A return address planted in `ra` before launching a sideloaded EXE. If the program returns
+/// (`jr ra`) instead of looping, PC lands here and we stop cleanly — reaching null isn't something
+/// a healthy test does mid-run, so it doubles as an "exited / jumped to null" signal.
+const SENTINEL_RA: u32 = 0x0000_0000;
+
+/// Post-injection instruction budget. A CPU test is short; this just bounds the run if a program
+/// neither prints its end-marker nor returns.
+const RUN_BUDGET: u64 = 50_000_000;
+
+/// Sideload a PS-EXE: boot the BIOS to the hand-off point (so the kernel tables and a valid stack
+/// exist), inject the image and set the registers the BIOS loader would, run with TTY capture until
+/// the program ends, then diff the captured TTY against the sibling `psx.log` golden log.
+fn run_sideload(cpu: &mut Cpu, exe_path: &str) {
+    if !cpu.bus.bios_loaded() {
+        eprintln!("\n(PS-EXE sideload needs a BIOS as the first argument — a 512 KiB image)");
+        std::process::exit(1);
+    }
+    let bytes = std::fs::read(exe_path).unwrap_or_else(|e| {
+        eprintln!("failed to read '{exe_path}': {e}");
+        std::process::exit(1);
+    });
+    let exe = PsxExe::parse(&bytes).unwrap_or_else(|| {
+        eprintln!("'{exe_path}' is not a PS-EXE (bad magic / too short)");
+        std::process::exit(1);
+    });
+
+    // 1. Boot the real BIOS to the hand-off, so the A0/B0/C0 tables AND a usable SP exist (these
+    //    test EXEs ship SP=0 on purpose and rely on the BIOS-established stack).
+    cpu.capture_tty = true;
+    println!("\n[sideload] booting BIOS to 0x{EXEC_POINT:08X} before injecting '{exe_path}' ...\n");
+    if run_until_pc(cpu, EXEC_POINT, BOOT_BUDGET).is_none() {
+        eprintln!("\n[sideload] BIOS stalled before 0x{EXEC_POINT:08X}; cannot inject.");
+        dump_regs(cpu);
+        std::process::exit(1);
+    }
+
+    // 2. Inject: copy the program image into RAM and hand-set the registers to the state the BIOS
+    //    loader leaves behind, so the EXE starts exactly as if the BIOS had loaded it off a disc.
+    //    Each value comes from the PS-EXE header (parsed in exe.rs):
+    //      * pc        — the entry point. We also prime next_pc/current_pc because the CPU core runs
+    //                    a two-PC model for branch-delay slots (next_pc is always "one instruction
+    //                    past pc"); leaving them stale would mis-handle the very first branch.
+    //      * r28 (gp)  — the "global pointer", a base register compiled C uses to reach its globals.
+    //      * r29 (sp), r30 (fp) — stack and frame pointers. IMPORTANT gotcha: these test EXEs carry
+    //                    an SP of 0 in their header, which by the format means "leave SP alone, use
+    //                    the one the kernel set up." If we wrote 0 into SP, the program's first stack
+    //                    push would hit address 0 and trample the kernel — so when the header SP is 0
+    //                    we deliberately keep the BIOS's value (this is exactly why we boot the real
+    //                    BIOS first, in step 1).
+    //      * r4 (a0), r5 (a1) — the argc/argv-style pair the BIOS hands a freshly-loaded program.
+    //      * r31 (ra)  — the return address. We plant a recognisable sentinel so that if the program
+    //                    returns (`jr ra`) instead of looping forever, PC lands there and we can stop.
+    cpu.bus.store_ram(exe.load_addr, &exe.data);
+    cpu.pc = exe.initial_pc;
+    cpu.next_pc = exe.initial_pc.wrapping_add(4);
+    cpu.current_pc = exe.initial_pc;
+    cpu.regs[28] = exe.initial_gp;
+    if exe.initial_sp != 0 {
+        cpu.regs[29] = exe.initial_sp;
+        cpu.regs[30] = exe.initial_sp;
+    }
+    cpu.regs[4] = 1;
+    cpu.regs[5] = 0;
+    cpu.regs[31] = SENTINEL_RA;
+
+    let tty_start = cpu.bus.tty_out.len(); // everything printed from here on is the EXE's
+    println!(
+        "[sideload] injected {} bytes at 0x{:08X} — entry 0x{:08X}, gp 0x{:08X}, sp 0x{:08X}\n",
+        exe.data.len(),
+        exe.load_addr,
+        exe.initial_pc,
+        exe.initial_gp,
+        cpu.regs[29]
+    );
+
+    // 3. Run until the program prints its end-marker ("Done." in the ps1-tests), returns to the
+    //    sentinel, or the budget runs out. Only scan for the marker when TTY actually grew.
+    let mut last_len = tty_start;
+    for _ in 0..RUN_BUDGET {
+        if cpu.pc == SENTINEL_RA {
+            break;
+        }
+        cpu.step();
+        if cpu.bus.tty_out.len() != last_len {
+            last_len = cpu.bus.tty_out.len();
+            if cpu.bus.tty_out.trim_end().ends_with("Done.") {
+                break;
+            }
+        }
+    }
+
+    // 4. Verdict.
+    let captured = cpu.bus.tty_out[tty_start..].to_string();
+    report_verdict(exe_path, &captured);
+}
+
+/// Compare a program's captured TTY against the golden `psx.log` shipped alongside it in the
+/// ps1-tests suite. Exits non-zero on a mismatch (or a self-reported failure) so it can be scripted.
+fn report_verdict(exe_path: &str, captured: &str) {
+    println!("\n----- captured TTY -----\n{captured}\n------------------------");
+
+    let golden_path = std::path::Path::new(exe_path).with_file_name("psx.log");
+    match std::fs::read_to_string(&golden_path) {
+        Ok(golden) => {
+            let want = strip_markers(normalize(&golden));
+            let got = normalize(captured);
+            // The golden log holds only the *test's own* output, but our capture can carry BIOS boot
+            // chatter ahead of it (e.g. the ResetGraph debug this BIOS revision prints), so we line
+            // up the tail of the capture with the golden rather than demanding a head-to-toe match.
+            let tail: &[String] = if got.len() >= want.len() {
+                &got[got.len() - want.len()..]
+            } else {
+                &got
+            };
+            if !want.is_empty() && tail == want {
+                println!("\n[verdict] MATCH — output matches {} (tail-aligned)", golden_path.display());
+            } else {
+                println!("\n[verdict] DIFFERS from {}", golden_path.display());
+                print_diff(&want, tail);
+                std::process::exit(1);
+            }
+        }
+        Err(_) => {
+            println!("\n[verdict] no sibling psx.log to compare against — captured output only.");
+            if captured.to_lowercase().contains("fail") {
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Break text into trimmed lines, dropping CRs and trailing blank lines, so a comparison doesn't
+/// hinge on cosmetic whitespace / line-ending differences.
+fn normalize(s: &str) -> Vec<String> {
+    let mut lines: Vec<String> = s
+        .replace('\r', "")
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .collect();
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines
+}
+
+/// The golden `psx.log` files prefix every line with "% " (the ps1-tests capture convention). Strip
+/// it so the reference lines line up with our raw TTY, which carries no such marker.
+fn strip_markers(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .map(|l| l.strip_prefix("% ").map(str::to_string).unwrap_or(l))
+        .collect()
+}
+
+/// Print the first handful of line-level differences between the golden log and what we captured.
+fn print_diff(want: &[String], got: &[String]) {
+    let mut shown = 0;
+    for i in 0..want.len().max(got.len()) {
+        let w = want.get(i).map(String::as_str).unwrap_or("<none>");
+        let g = got.get(i).map(String::as_str).unwrap_or("<none>");
+        if w != g {
+            println!("  line {:>3}: expected `{w}`  |  got `{g}`", i + 1);
+            shown += 1;
+            if shown >= 10 {
+                println!("  ... (further differences omitted)");
+                break;
+            }
+        }
+    }
 }
 
 // ===== built-in CPU self-test ===========================================================

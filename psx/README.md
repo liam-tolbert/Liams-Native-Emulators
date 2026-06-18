@@ -4,13 +4,14 @@ A from-scratch PlayStation 1 (MIPS R3000A) emulator in Rust — the third and mo
 emulator in this collection, and the current focus. It is built clean-room from primary
 hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) and test ROMs.
 
-> **Status: M2 — memory map, MMIO & exceptions.** On top of the M1 CPU core, the bus is
-> complete (segment-masked memory map, the `0x1F801xxx` I/O block, byte/half/word access) and
-> the exception/COP0 unit is now exercised end-to-end: misaligned-load/store address errors, the
-> full interrupt-delivery chain (a source raises `I_STAT` → masked by `I_MASK` → COP0 `Cause.IP2`
-> → gated by `SR.IEc`/`SR.IM` → the `Interrupt` exception → `RFE`), the SR mode/IRQ stack, and
-> cache-isolation. All of it is gated by the built-in, ROM-free `selftest`. The BIOS-boot TTY
-> harness (M3) is next.
+> **Status: M3 — BIOS boot & PS-EXE test harness.** The emulator now runs real software. It boots
+> the actual PS1 BIOS headless to the shell hand-off point (`0x80030000`) — the kernel banner comes
+> out through a TTY hook that snoops `std_out_putchar` at the BIOS call vectors — and then
+> *sideloads* a PS-EXE: it injects the program at the hand-off, sets PC/GP/SP the way the BIOS
+> loader would, runs it, and diffs the captured TTY against the test's golden `psx.log`. The
+> JaCzekanski `ps1-tests` **`cpu/cop`** test passes (matches its reference log); reaching that also
+> fixed a real coprocessor bug — coprocessor ops are now gated on the `SR.CU` "usable" bits instead
+> of always faulting. M4 (the GPU) is next.
 
 ## Roadmap
 
@@ -19,13 +20,15 @@ hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) 
 | **M0** | Crate scaffold: module layout, run-mode skeleton, reset wiring | **done** |
 | **M1** | MIPS R3000A interpreter (branch- & load-delay slots, the full integer set) | **done** |
 | **M2** | Memory map + MMIO + exceptions / COP0 | **done** |
-| **M3** | BIOS boot + PS-EXE sideload + headless TTY harness → pass the CPU test ROMs | next |
-| M4 | GPU: VRAM, GP0/GP1 FIFO, software rasterizer → first rendered frame | later |
+| **M3** | BIOS boot + PS-EXE sideload + headless TTY harness → pass the CPU test ROMs | **done** |
+| **M4** | GPU: VRAM, GP0/GP1 FIFO, software rasterizer → first rendered frame | next |
 | M5+ | GTE, CD-ROM, SPU audio, controllers, then a dynamic recompiler (JIT) | later |
 
 The guiding discipline is *correctness before graphics*: the CPU is validated headlessly by
-capturing the BIOS TTY output and running the amidog CPU test ROMs — the same trick the Game
-Boy emulator used with Blargg's serial-port tests.
+capturing the BIOS TTY output and running CPU test ROMs (the JaCzekanski `ps1-tests` suite) — the
+same trick the Game Boy emulator used with Blargg's serial-port tests. `cpu/cop` passes today; the
+remaining `cpu/` tests are deferred — they probe behaviour modelled loosely on purpose
+(cycle-accurate access *timing*, and per-access-width MMIO), or need the GPU/DMA that arrive in M4.
 
 ## Building
 
