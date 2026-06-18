@@ -30,6 +30,7 @@ mod cpu;
 mod dma;
 mod exe;
 mod gpu;
+mod img;
 mod irq;
 
 use bus::Bus;
@@ -109,9 +110,7 @@ fn main() {
                 run_selftest();
             }
         }
-        Some("dump") => {
-            println!("\n[GPU frame thumbnail] — arrives with the M4 GPU.");
-        }
+        Some("dump") => run_dump(&mut cpu),
         Some(other) => {
             run_sideload(&mut cpu, other);
         }
@@ -229,6 +228,114 @@ fn run_bios_boot(cpu: &mut Cpu) {
             std::process::exit(1);
         }
     }
+}
+
+// ===== GPU frame dump / VRAM verify harness (M4) ========================================
+//
+// The graphics analog of the serial/Blargg golden-file trick: snapshot VRAM and either eyeball it
+// (ASCII thumbnail), save it (PNG, via the from-scratch codec in `img.rs`), or diff it pixel-for-
+// pixel against a reference PNG. M4a stands this up and calibrates it; from M4b on it gates the
+// rasterizer against the `ps1-tests` reference images.
+
+/// VRAM is a fixed 1024x512 grid of 16-bit pixels (matches `gpu.rs`).
+const VRAM_W: usize = 1024;
+const VRAM_H: usize = 512;
+
+/// `dump` run-mode: boot the BIOS (so anything it draws is in VRAM), then snapshot VRAM to a PNG and
+/// print an ASCII thumbnail. In M4a nothing is rasterized yet — a black frame here is expected and
+/// correct; the pipeline (VRAM -> RGB -> PNG) is what's being exercised.
+fn run_dump(cpu: &mut Cpu) {
+    if cpu.bus.bios_loaded() {
+        cpu.capture_tty = true;
+        println!("\n[dump] booting BIOS to 0x{EXEC_POINT:08X} before snapshotting VRAM ...\n");
+        let _ = run_until_pc(cpu, EXEC_POINT, BOOT_BUDGET);
+    } else {
+        println!("\n[dump] no BIOS loaded — dumping the (empty) power-on VRAM.");
+    }
+
+    let rgb = vram_to_rgb(cpu.bus.gpu.vram());
+    print_vram_ascii(&rgb);
+
+    let png = img::encode_rgb(VRAM_W as u32, VRAM_H as u32, &rgb);
+    let path = "vram_dump.png";
+    match std::fs::write(path, &png) {
+        Ok(_) => println!("\n[dump] wrote {path}  ({VRAM_W}x{VRAM_H} VRAM, {} bytes)", png.len()),
+        Err(e) => eprintln!("\n[dump] failed to write {path}: {e}"),
+    }
+    println!("[dump] (VRAM stays black until the rasterizer lands in M4b/M4c.)");
+}
+
+/// Expand the full 1024x512 VRAM into a packed 24-bit RGB buffer (`VRAM_W*VRAM_H*3` bytes). This is
+/// the **single place** the 15->24-bit colour expansion is defined, so the dump, the PNG, and the
+/// diff all agree.
+fn vram_to_rgb(vram: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vram.len() * 3);
+    for &px in vram {
+        // **Gotcha: 1-5-5-5 little-endian, with RED in the low bits** (mask:1 | B:5 | G:5 | R:5).
+        // Reading them in screen order R,G,B means pulling the *low* field first — getting this
+        // backwards paints everything blue-for-red, the classic first GPU bug.
+        let r5 = (px & 0x1F) as u8;
+        let g5 = ((px >> 5) & 0x1F) as u8;
+        let b5 = ((px >> 10) & 0x1F) as u8;
+        out.push(expand5(r5));
+        out.push(expand5(g5));
+        out.push(expand5(b5));
+    }
+    out
+}
+
+/// Expand a 5-bit channel to 8 bits by bit-replication (`abcde -> abcdeabc`), so 0x1F maps to a true
+/// 0xFF rather than 0xF8. (If the `ps1-tests` references turn out to top-align instead, M4a's
+/// calibration check is where we'd notice and switch to `v << 3`.)
+fn expand5(v: u8) -> u8 {
+    (v << 3) | (v >> 2)
+}
+
+/// Print a coarse ASCII thumbnail of VRAM — the same quick eyeball the Game Boy `dump` mode gives.
+/// Down-samples to 64x24 cells, mapping each sampled pixel's brightness onto a 10-step ramp.
+fn print_vram_ascii(rgb: &[u8]) {
+    const COLS: usize = 64;
+    const ROWS: usize = 24;
+    const RAMP: &[u8] = b" .:-=+*#%@";
+    println!("\n[VRAM thumbnail {COLS}x{ROWS} of {VRAM_W}x{VRAM_H}]");
+    for row in 0..ROWS {
+        let mut line = String::with_capacity(COLS);
+        for col in 0..COLS {
+            // Sample one pixel near the centre of this cell.
+            let x = col * VRAM_W / COLS;
+            let y = row * VRAM_H / ROWS;
+            let i = (y * VRAM_W + x) * 3;
+            let lum = (rgb[i] as u32 + rgb[i + 1] as u32 + rgb[i + 2] as u32) / 3;
+            let idx = (lum as usize * (RAMP.len() - 1)) / 255;
+            line.push(RAMP[idx] as char);
+        }
+        println!("    {line}");
+    }
+}
+
+/// Diff a VRAM snapshot against a reference PNG, pixel-exact. Used from M4b on to gate the rasterizer
+/// against the `ps1-tests` reference images; wired in now so the harness is complete.
+#[allow(dead_code)] // first real caller is M4b
+fn diff_vram_vs_png(vram: &[u16], ref_path: &str) -> bool {
+    let bytes = match std::fs::read(ref_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[diff] cannot read {ref_path}: {e}");
+            return false;
+        }
+    };
+    let (w, h, ref_rgb) = match img::decode_rgb(&bytes) {
+        Some(t) => t,
+        None => {
+            eprintln!("[diff] {ref_path} isn't a PNG this harness can read yet (M4b adds inflate)");
+            return false;
+        }
+    };
+    if (w as usize, h as usize) != (VRAM_W, VRAM_H) {
+        eprintln!("[diff] size mismatch: ref {w}x{h} vs VRAM {VRAM_W}x{VRAM_H}");
+        return false;
+    }
+    vram_to_rgb(vram) == ref_rgb
 }
 
 // ----- PS-EXE sideload ------------------------------------------------------------------
@@ -772,6 +879,110 @@ fn run_selftest() -> bool {
         run(&mut cpu, prog.len());
         check(&mut pass, "isolated store dropped (r6)", cpu.regs[6], 0);
         check(&mut pass, "normal store wrote (r7)", cpu.regs[7], 0x0000_BBBB);
+    }
+
+    // ===== M4a: GPU register model + the PNG verify harness ============================
+    // The GPU draws nothing yet, so these don't use the `gpu/` reference images — they pin the
+    // register model (GP0 state commands + GP1 knobs surfaced through GPUSTAT, and the GP0 FIFO
+    // consuming the right word counts) and calibrate the VRAM -> RGB -> PNG -> RGB round-trip the
+    // rasterizer stages will be graded against.
+
+    // --- GPUSTAT bits assembled from GP0/GP1 state -------------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000); // GP1(00) reset -> known baseline
+
+        // GP0(E1) draw-mode low 11 bits map straight to GPUSTAT bits 0-10.
+        g.gp0(0xE100_0123);
+        check(&mut pass, "GPUSTAT draw-mode bits 0-10", g.status() & 0x7FF, 0x123);
+
+        // GP0(E6) mask settings -> GPUSTAT bits 11 (set-mask) and 12 (check-mask).
+        g.gp0(0xE600_0003);
+        check(&mut pass, "GPUSTAT mask bits 11/12", (g.status() >> 11) & 3, 3);
+
+        // GP1(03) display enable/disable -> GPUSTAT bit 23 (1 = disabled).
+        g.gp1(0x0300_0001);
+        check(&mut pass, "GPUSTAT display-disabled (bit 23)", (g.status() >> 23) & 1, 1);
+        g.gp1(0x0300_0000);
+        check(&mut pass, "GPUSTAT display-enabled (bit 23)", (g.status() >> 23) & 1, 0);
+
+        // GP1(04) DMA direction -> bits 29-30, and the bit-25 data-request mirror (direction 2
+        // mirrors the DMA-block-ready bit 28, which we force high).
+        g.gp1(0x0400_0002);
+        check(&mut pass, "GPUSTAT DMA direction (bits 29-30)", (g.status() >> 29) & 3, 2);
+        check(&mut pass, "GPUSTAT DMA request (bit 25)", (g.status() >> 25) & 1, 1);
+
+        // GP0(1F) raises the GPU IRQ (bit 24); GP1(02) acknowledges it.
+        g.gp0(0x1F00_0000);
+        check(&mut pass, "GPUSTAT GPU-IRQ set (bit 24)", (g.status() >> 24) & 1, 1);
+        g.gp1(0x0200_0000);
+        check(&mut pass, "GPUSTAT GPU-IRQ cleared (bit 24)", (g.status() >> 24) & 1, 0);
+
+        // The "ready" bits (26/27/28) stay high so a polling BIOS proceeds.
+        check(&mut pass, "GPUSTAT ready bits 26/27/28", (g.status() >> 26) & 7, 7);
+    }
+
+    // --- GP0 FIFO consumes exactly the right number of words ---------------------------
+    // If a multi-word draw command miscounts, the *next* command desyncs. Send a 4-word flat
+    // triangle, then an E4 draw-area setting, and read that setting back via GP1(10): it only
+    // round-trips correctly if the triangle swallowed exactly its 4 words.
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(0x2000_00FF); // flat triangle (cmd 0x20): colour word + 3 vertices = 4 words
+        g.gp0(0x0000_0000); // vertex 0
+        g.gp0(0x0010_0000); // vertex 1
+        g.gp0(0x0000_0010); // vertex 2 (command complete here)
+        g.gp0(0xE400_0000 | (200 << 10) | 300); // draw area bottom-right = (300, 200)
+        g.gp1(0x1000_0004); // GPU-info request 4 -> draw-area BR into GPUREAD
+        check(&mut pass, "GP0 FIFO in sync after a triangle", g.read(), 300 | (200 << 10));
+    }
+
+    // --- CPU->VRAM (A0) image upload drains the right pixel-word count ------------------
+    // A 2x2 upload is 4 pixels = 2 data words. After draining them an E3 setting must land cleanly.
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(0xA000_0000); // CPU->VRAM
+        g.gp0(0x0000_0000); // destination (0, 0)
+        g.gp0(0x0002_0002); // size 2 x 2 -> 4 pixels -> 2 data words
+        g.gp0(0xDEAD_BEEF); // pixel data word 1 (dropped in M4a)
+        g.gp0(0xCAFE_BABE); // pixel data word 2
+        g.gp0(0xE300_0000 | (20 << 10) | 10); // draw area top-left = (10, 20)
+        g.gp1(0x1000_0003); // GPU-info request 3 -> draw-area TL
+        check(&mut pass, "GP0 image upload drained its data", g.read(), 10 | (20 << 10));
+    }
+
+    // --- harness calibration: VRAM -> RGB -> PNG -> RGB round-trips exactly -------------
+    {
+        let mut bus = Bus::new();
+        {
+            let v = bus.gpu.vram_mut();
+            v[0] = 0x001F; // pure red   (R = 31, in the low 5 bits)
+            v[1] = 0x03E0; // pure green (G = 31)
+            v[VRAM_W] = 0x7C00; // pure blue (B = 31), first pixel of row 1
+            v[VRAM_W + 1] = 0x7FFF; // white
+        }
+        let rgb = vram_to_rgb(bus.gpu.vram());
+        // 5-bit 31 expands to 8-bit 255; the empty channels stay 0.
+        let px0 = (rgb[0] as u32) << 16 | (rgb[1] as u32) << 8 | rgb[2] as u32;
+        let px1 = (rgb[3] as u32) << 16 | (rgb[4] as u32) << 8 | rgb[5] as u32;
+        check(&mut pass, "VRAM red -> 0xFF0000", px0, 0xFF_0000);
+        check(&mut pass, "VRAM green -> 0x00FF00", px1, 0x00_FF00);
+
+        // Encode then decode must return identical pixels and dimensions.
+        let png = img::encode_rgb(VRAM_W as u32, VRAM_H as u32, &rgb);
+        match img::decode_rgb(&png) {
+            Some((w, h, rgb2)) => {
+                check(&mut pass, "PNG round-trip width", w, VRAM_W as u32);
+                check(&mut pass, "PNG round-trip height", h, VRAM_H as u32);
+                check(&mut pass, "PNG round-trip pixels match", (rgb2 == rgb) as u32, 1);
+            }
+            None => check(&mut pass, "PNG round-trip decodes", 0, 1),
+        }
     }
 
     println!(
