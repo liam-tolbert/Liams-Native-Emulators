@@ -9,6 +9,12 @@ edition = "2024"
 # GPU exists (M4); the foundation milestones (M0-M3) are all headless.
 minifb = "0.27"
 
+# Test-harness only (M4b): decode the `ps1-tests` reference VRAM images, which are real
+# DEFLATE-compressed PNGs, so the GPU output can be diffed pixel-for-pixel against them.
+# This is host-side verification glue, not part of the emulated machine — the emulator core
+# stays dependency-light and clean-room. (Used in `img.rs`.)
+png = "0.17"
+
 # A debug build single-steps far too slowly to boot a real BIOS in reasonable time.
 # Optimise even the dev profile a little so the headless harness stays usable; the
 # release profile is what actually runs the test ROMs.

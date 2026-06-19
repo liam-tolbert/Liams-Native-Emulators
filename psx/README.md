@@ -11,9 +11,9 @@ hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) 
 > loader would, runs it, and diffs the captured TTY against the test's golden `psx.log`. The
 > JaCzekanski `ps1-tests` **`cpu/cop`** test passes (matches its reference log); reaching that also
 > fixed a real coprocessor bug — coprocessor ops are now gated on the `SR.CU` "usable" bits instead
-> of always faulting. M4 (the GPU) is now underway: **M4a** — the VRAM + GP0/GP1 command model + a
-> real GPUSTAT, plus the from-scratch PNG verify harness — is done; the VRAM transfers and the
-> software rasterizer follow (see the M4 plan below).
+> of always faulting. M4 (the GPU) is now underway: **M4a** (VRAM + GP0/GP1 model + GPUSTAT + the PNG
+> verify harness) and **M4b** (VRAM transfer & fill commands) are done; **DMA is next** — the keystone
+> the test ROMs feed their GPU commands through — then the rasterizer (see the M4 plan below).
 
 ## Roadmap
 
@@ -25,9 +25,9 @@ hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) 
 | **M3** | BIOS boot + PS-EXE sideload + headless TTY harness → pass the CPU test ROMs | **done** |
 | **M4** | **GPU → first rendered frame** (built in the stages M4a–M4e below) | in progress |
 | ↳ M4a | VRAM + GP0/GP1 command model + real GPUSTAT + the PNG verify harness | **done** |
-| ↳ M4b | VRAM transfer & fill commands (`02` / `A0` / `C0` / `80`) | next |
-| ↳ M4c | software rasterizer (polygons, rectangles, lines, textures) | later |
-| ↳ M4d | DMA channels 2 (GPU) + 6 (OTC) + the DMA interrupt | later |
+| ↳ M4b | VRAM transfer & fill commands (`02` / `A0` / `C0` / `80`) | **done** |
+| ↳ M4c | DMA channels 2 (GPU) + 6 (OTC) + the DMA interrupt | next |
+| ↳ M4d | software rasterizer (polygons, rectangles, lines, textures) | later |
 | ↳ M4e | display timing (VBlank) + the `minifb` window → BIOS-logo demo | later |
 | **M4.5** | Root counters / timers (TIMER0/1/2) | later |
 | M5+ | GTE, CD-ROM, SPU audio, controllers, then a dynamic recompiler (JIT) | later |
@@ -47,11 +47,18 @@ M4 is built in five stages, each planned and implemented on its own so the diff 
   sync), a real `GPUSTAT`, and a from-scratch PNG dump/diff harness. That harness is the graphics
   analog of the serial-port golden-file trick: render into VRAM, then diff pixel-for-pixel against the
   `ps1-tests` `gpu/` reference PNGs.
-- **M4b — VRAM transfers & fill** (`02` fill, `A0`/`C0` CPU↔VRAM, `80` VRAM→VRAM).
-- **M4c — the software rasterizer** (flat/Gouraud/textured polygons, rectangles/sprites, lines; plus
+- **M4b — VRAM transfers & fill (done).** `02` fill, `A0`/`C0` CPU↔VRAM, `80` VRAM→VRAM. Validated by
+  the self-test's direct-GP0 round-trips; the suite's `gpu/` reference ROMs feed the GPU through DMA,
+  so they reference-validate once M4c lands. (The PNG reader is now the `png` crate, so the harness
+  reads the suite's compressed references; the 5→8-bit colour expansion is calibrated to the suite's
+  top-aligned form.)
+- **M4c — DMA (next).** Channels 2 (GPU) and 6 (OTC) — including the linked-list display lists real
+  games *and the test ROMs* submit frames through — plus the DMA interrupt. This is the keystone:
+  every `gpu/` ROM drives the GPU via DMA, so it's what makes the M4b transfers (and then the M4d
+  rasterizer) validate against the reference images. (Moved ahead of the rasterizer for exactly this
+  reason — discovered during M4b that the ROMs never touch the GP0 port directly.)
+- **M4d — the software rasterizer** (flat/Gouraud/textured polygons, rectangles/sprites, lines; plus
   semi-transparency, dithering, and the mask bit).
-- **M4d — DMA** channels 2 (GPU) and 6 (OTC) — including the linked-list display lists real games
-  submit frames through — plus the DMA interrupt.
 - **M4e — display timing + window**: the ~60 Hz VBlank tick that drives game loops, and a `minifb`
   window. Demo target: the real BIOS booting to its **Sony Computer Entertainment logo** on screen —
   that logo is GPU-drawn, so a correct M4 renders it with no game or CD-ROM needed.
@@ -69,8 +76,10 @@ cd psx
 cargo build --release
 ```
 
-Only dependency is [`minifb`](https://crates.io/crates/minifb) (pure-Rust window/framebuffer),
-used once the GPU lands in M4. The foundation milestones are all headless.
+Dependencies: [`minifb`](https://crates.io/crates/minifb) (pure-Rust window/framebuffer, wired in at
+M4e) and [`png`](https://crates.io/crates/png) (**test-harness only** — decodes the `ps1-tests`
+reference VRAM images for the M4 pixel-diffs; the emulated machine never touches it). The foundation
+milestones are headless.
 
 ## Running
 

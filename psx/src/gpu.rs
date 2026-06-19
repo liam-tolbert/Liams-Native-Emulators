@@ -45,6 +45,8 @@
 //! The draw-*state* commands (`E1`-`E6`) and the GP1 knobs are fully modelled now, because GPUSTAT is
 //! assembled from them and later stages will read them straight back.
 
+use std::cell::Cell;
+
 /// VRAM is 1024 wide x 512 tall, 16 bits per pixel = exactly 1 MiB.
 const VRAM_W: usize = 1024;
 const VRAM_H: usize = 512;
@@ -118,6 +120,22 @@ pub struct Gpu {
     /// The GPU's own interrupt request (GP0(1F) raises it, GP1(02) acknowledges it). GPUSTAT bit 24;
     /// it feeds IRQ source 1 once that's wired in a later stage.
     irq: bool,
+
+    // ===== in-progress VRAM image transfers (M4b) =======================================
+    /// CPU->VRAM upload (`A0`) cursor: the destination rectangle and how many of its pixels have been
+    /// written so far. While `gp0_img_words` is non-zero, GP0 data words land here.
+    up_x: u16,
+    up_y: u16,
+    up_w: u16,
+    up_h: u16,
+    up_px: u32,
+    /// VRAM->CPU download (`C0`) cursor. `dl_px` is a `Cell` because GPUREAD advances the stream from
+    /// `read(&self)` — a read that mutates, the ownership wrinkle flagged in M4a (see `read`).
+    dl_x: u16,
+    dl_y: u16,
+    dl_w: u16,
+    dl_h: u16,
+    dl_px: Cell<u32>,
 }
 
 impl Gpu {
@@ -153,6 +171,16 @@ impl Gpu {
             display_mode: 0,
             gpuread: 0,
             irq: false,
+            up_x: 0,
+            up_y: 0,
+            up_w: 0,
+            up_h: 0,
+            up_px: 0,
+            dl_x: 0,
+            dl_y: 0,
+            dl_w: 0,
+            dl_h: 0,
+            dl_px: Cell::new(0),
         }
     }
 
@@ -171,7 +199,6 @@ impl Gpu {
     /// hardware silently masks X to 0..1023 and Y to 0..511 rather than faulting. A primitive whose
     /// offset pushes it off the right edge reappears on the left, so the wrap is behaviour to
     /// reproduce, not an error to guard against. (Used by M4b/M4c; here so the rule lives in one spot.)
-    #[allow(dead_code)] // first real caller is M4b
     fn vram_set(&mut self, x: i32, y: i32, color: u16) {
         let x = (x as usize) & (VRAM_W - 1); // & 1023  (VRAM_W is a power of two)
         let y = (y as usize) & (VRAM_H - 1); // & 511
@@ -179,7 +206,6 @@ impl Gpu {
     }
 
     /// Read one pixel, with the same wrap as `vram_set`.
-    #[allow(dead_code)] // first real caller is M4b
     fn vram_get(&self, x: i32, y: i32) -> u16 {
         let x = (x as usize) & (VRAM_W - 1);
         let y = (y as usize) & (VRAM_H - 1);
@@ -246,20 +272,57 @@ impl Gpu {
         s
     }
 
-    /// `GPUREAD` (`0x1F801810` read) — the answer to a GP1(10) "GPU info" request. VRAM->CPU image
-    /// read-back (the `C0` command) also reports through here, but that's M4b.
+    /// `GPUREAD` (`0x1F801810` read). While a VRAM->CPU (`C0`) transfer is active this streams the
+    /// source rectangle back, two pixels per word; otherwise it returns the staged GP1(10) "GPU info"
+    /// response.
+    ///
+    /// **Gotcha:** this read *mutates* — each call advances the transfer cursor — yet it has to stay
+    /// `&self`, because the CPU reaches it through `bus.read32 -> io_read -> gpu.read`, all `&self`.
+    /// So `dl_px` is a `Cell`: the cursor advances through a shared reference while VRAM itself is only
+    /// *read* here (never written), which keeps the whole CPU read path untouched.
     pub fn read(&self) -> u32 {
-        self.gpuread
+        let total = self.dl_w as u32 * self.dl_h as u32;
+        let px = self.dl_px.get();
+        if px >= total {
+            return self.gpuread; // no transfer in flight -> the GPU-info value
+        }
+        let mut word = 0u32;
+        let mut sent = px;
+        for half in 0..2 {
+            if sent >= total {
+                break; // odd final pixel: only the low half is valid
+            }
+            let x = self.dl_x as i32 + (sent % self.dl_w as u32) as i32;
+            let y = self.dl_y as i32 + (sent / self.dl_w as u32) as i32;
+            word |= (self.vram_get(x, y) as u32) << (half * 16);
+            sent += 1;
+        }
+        self.dl_px.set(sent);
+        word
     }
 
     /// GP0 (`0x1F801810` write) — the drawing / data port. This is the FIFO state machine described
     /// in the module header: accumulate a command's words, then dispatch it.
     pub fn gp0(&mut self, word: u32) {
-        // --- mid image upload: this word is raw pixel data, not a command ----------------------
-        // A `A0` (CPU->VRAM) command is a 3-word header followed by width*height pixels packed two
-        // to a word. While that data stream is flowing we must NOT re-interpret it as commands.
+        // --- mid image upload: this word is two pixels for the CPU->VRAM (`A0`) rectangle ----------
+        // A `A0` command is a 3-word header followed by width*height pixels packed two to a word (low
+        // half first). While that data stream is flowing these words are pixel data, not commands:
+        // write them across the destination rectangle, left to right then top to bottom, advancing the
+        // upload cursor. A final word with an odd pixel left over writes one and ignores its high half.
+        // (Each pixel carries its own mask bit in data bit 15 — written as-is by `vram_set`.)
         if self.gp0_img_words > 0 {
-            self.gp0_img_words -= 1; // M4a: drop the pixel data. M4b writes it into VRAM here.
+            let total = self.up_w as u32 * self.up_h as u32;
+            for half in 0..2 {
+                if self.up_px >= total {
+                    break;
+                }
+                let pixel = (word >> (half * 16)) as u16; // low half, then high half
+                let x = self.up_x as i32 + (self.up_px % self.up_w as u32) as i32;
+                let y = self.up_y as i32 + (self.up_px / self.up_w as u32) as i32;
+                self.vram_set(x, y, pixel);
+                self.up_px += 1;
+            }
+            self.gp0_img_words -= 1;
             return;
         }
 
@@ -412,7 +475,25 @@ impl Gpu {
         match cmd {
             0x00 => {}                  // NOP
             0x01 => {}                  // clear texture cache — nothing to model (no cache yet)
-            0x02 => { /* fill rectangle — M4b */ }
+            0x02 => {
+                // Fill rectangle: a fast block fill in a flat colour. **Gotcha: fill has its OWN
+                // coordinate rules** — X and width snap to 16-pixel units (X &= 0x3F0, width rounds
+                // *up* to a multiple of 16), Y/height mask to the VRAM height — and it **ignores** the
+                // mask bit and semi-transparency, unlike a *drawn* rectangle. The 24-bit command
+                // colour is truncated to 15-bit (mask bit left 0).
+                let pos = self.gp0_buffer[1];
+                let size = self.gp0_buffer[2];
+                let fx = (pos & 0x3F0) as i32;
+                let fy = ((pos >> 16) & 0x1FF) as i32;
+                let fw = (((size & 0x3FF) + 0x0F) & !0x0F) as i32;
+                let fh = ((size >> 16) & 0x1FF) as i32;
+                let color = rgb24_to_15(w0);
+                for yy in 0..fh {
+                    for xx in 0..fw {
+                        self.vram_set(fx + xx, fy + yy, color);
+                    }
+                }
+            }
             0x1F => self.irq = true,    // request a GPU interrupt (GPUSTAT bit 24)
 
             // --- draw-state settings (fully modelled now; the rasterizer reads these in M4c) -----
@@ -443,16 +524,47 @@ impl Gpu {
             0x40..=0x5F => { /* line (non-polyline; polylines drain in gp0) */ }
             0x60..=0x7F => { /* rectangle / sprite */ }
 
-            // --- VRAM transfers — parsed-and-dropped until M4b ----------------------------------
-            0x80..=0x9F => { /* VRAM -> VRAM copy */ }
+            // --- VRAM transfers (M4b) -----------------------------------------------------------
+            0x80..=0x9F => {
+                // VRAM -> VRAM block copy: source, destination, size. **Gotcha: source and
+                // destination may overlap** (the `vram-to-vram-overlap` test exists for exactly this);
+                // we copy top-to-bottom, left-to-right with VRAM coordinate wrap.
+                let src = self.gp0_buffer[1];
+                let dst = self.gp0_buffer[2];
+                let (w, h) = transfer_size(self.gp0_buffer[3]);
+                let (sx, sy) = ((src & 0x3FF) as i32, ((src >> 16) & 0x1FF) as i32);
+                let (dx, dy) = ((dst & 0x3FF) as i32, ((dst >> 16) & 0x1FF) as i32);
+                for yy in 0..h as i32 {
+                    for xx in 0..w as i32 {
+                        let p = self.vram_get(sx + xx, sy + yy);
+                        self.vram_set(dx + xx, dy + yy, p);
+                    }
+                }
+            }
             0xA0..=0xBF => {
-                // CPU -> VRAM image upload: the 3-word header is in; the pixel stream follows. Work
-                // out how many data words to swallow (two 16-bit pixels per 32-bit word, rounded up)
-                // so `gp0` routes them as data instead of mistaking the first as a new command.
+                // CPU -> VRAM upload: the 3-word header (command, destination, size) is in. Latch the
+                // destination rectangle + pixel cursor, and set `gp0_img_words` so the following data
+                // words route into the image branch in `gp0` (two pixels per word, rounded up).
+                let dst = self.gp0_buffer[1];
                 let (w, h) = transfer_size(self.gp0_buffer[2]);
+                self.up_x = (dst & 0x3FF) as u16;
+                self.up_y = ((dst >> 16) & 0x1FF) as u16;
+                self.up_w = w as u16;
+                self.up_h = h as u16;
+                self.up_px = 0;
                 self.gp0_img_words = ((w * h + 1) / 2) as usize;
             }
-            0xC0..=0xDF => { /* VRAM -> CPU copy: data leaves via GPUREAD — M4b */ }
+            0xC0..=0xDF => {
+                // VRAM -> CPU download: latch the source rectangle and reset the read cursor; the data
+                // is pulled out word-by-word through GPUREAD (`read`), not pushed from here.
+                let src = self.gp0_buffer[1];
+                let (w, h) = transfer_size(self.gp0_buffer[2]);
+                self.dl_x = (src & 0x3FF) as u16;
+                self.dl_y = ((src >> 16) & 0x1FF) as u16;
+                self.dl_w = w as u16;
+                self.dl_h = h as u16;
+                self.dl_px.set(0);
+            }
 
             _ => {} // anything else: treated as a 1-word no-op
         }
@@ -531,4 +643,13 @@ fn transfer_size(wh: u32) -> (u32, u32) {
     let w = (((wh & 0xFFFF).wrapping_sub(1)) & 0x3FF) + 1;
     let h = ((((wh >> 16) & 0xFFFF).wrapping_sub(1)) & 0x1FF) + 1;
     (w, h)
+}
+
+/// Truncate a 24-bit GP0 command colour (`0x00BBGGRR` — red in the low byte) to a 15-bit VRAM pixel
+/// (`0bbbbbgggggrrrrr`, mask bit 0). Each 8-bit channel keeps its top 5 bits.
+fn rgb24_to_15(c: u32) -> u16 {
+    let r = (c & 0xFF) >> 3;
+    let g = ((c >> 8) & 0xFF) >> 3;
+    let b = ((c >> 16) & 0xFF) >> 3;
+    (r | (g << 5) | (b << 10)) as u16
 }

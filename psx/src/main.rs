@@ -284,11 +284,12 @@ fn vram_to_rgb(vram: &[u16]) -> Vec<u8> {
     out
 }
 
-/// Expand a 5-bit channel to 8 bits by bit-replication (`abcde -> abcdeabc`), so 0x1F maps to a true
-/// 0xFF rather than 0xF8. (If the `ps1-tests` references turn out to top-align instead, M4a's
-/// calibration check is where we'd notice and switch to `v << 3`.)
+/// Expand a 5-bit channel to 8 bits. **Calibrated against the `ps1-tests` references (M4b):** the
+/// suite top-aligns (`v << 3`), so 0x1F maps to 0xF8 and no channel ever reaches 0xFF — confirmed
+/// empirically (a reference scan finds no 255). This must match the suite's generator exactly or the
+/// pixel-diff is off by the low bits everywhere; bit-replication (`(v<<3)|(v>>2)`) was the wrong guess.
 fn expand5(v: u8) -> u8 {
-    (v << 3) | (v >> 2)
+    v << 3
 }
 
 /// Print a coarse ASCII thumbnail of VRAM — the same quick eyeball the Game Boy `dump` mode gives.
@@ -313,9 +314,10 @@ fn print_vram_ascii(rgb: &[u8]) {
     }
 }
 
-/// Diff a VRAM snapshot against a reference PNG, pixel-exact. Used from M4b on to gate the rasterizer
-/// against the `ps1-tests` reference images; wired in now so the harness is complete.
-#[allow(dead_code)] // first real caller is M4b
+/// Diff a VRAM snapshot against a reference PNG, pixel-exact. Returns true on a perfect match; on a
+/// mismatch it prints how far off we are, including a hint that distinguishes a real rendering bug
+/// from a mere colour-expansion miscalibration (the M4b "is `expand5` right?" question — if *every*
+/// channel is off by <= 7, it's the 5->8 expansion, not the pixels).
 fn diff_vram_vs_png(vram: &[u16], ref_path: &str) -> bool {
     let bytes = match std::fs::read(ref_path) {
         Ok(b) => b,
@@ -327,7 +329,7 @@ fn diff_vram_vs_png(vram: &[u16], ref_path: &str) -> bool {
     let (w, h, ref_rgb) = match img::decode_rgb(&bytes) {
         Some(t) => t,
         None => {
-            eprintln!("[diff] {ref_path} isn't a PNG this harness can read yet (M4b adds inflate)");
+            eprintln!("[diff] {ref_path} isn't an 8-bit RGB PNG the harness can read");
             return false;
         }
     };
@@ -335,7 +337,36 @@ fn diff_vram_vs_png(vram: &[u16], ref_path: &str) -> bool {
         eprintln!("[diff] size mismatch: ref {w}x{h} vs VRAM {VRAM_W}x{VRAM_H}");
         return false;
     }
-    vram_to_rgb(vram) == ref_rgb
+
+    let rgb = vram_to_rgb(vram);
+    if rgb == ref_rgb {
+        return true;
+    }
+
+    // Mismatch — quantify it and hint at the cause.
+    let mut diff_px = 0usize;
+    let mut max_delta = 0u8;
+    let mut ref_has_255 = false;
+    for (a, b) in rgb.chunks_exact(3).zip(ref_rgb.chunks_exact(3)) {
+        if a != b {
+            diff_px += 1;
+        }
+        for k in 0..3 {
+            max_delta = max_delta.max(a[k].abs_diff(b[k]));
+            ref_has_255 |= b[k] == 0xFF;
+        }
+    }
+    eprintln!(
+        "[diff] {diff_px} / {} pixels differ; max channel delta {max_delta}; reference reaches 255: {ref_has_255}",
+        VRAM_W * VRAM_H
+    );
+    if max_delta <= 7 {
+        eprintln!(
+            "[diff] all deltas <= 7 — this is a 5->8 colour-expansion mismatch, not a rendering bug \
+             (adjust `expand5`)."
+        );
+    }
+    false
 }
 
 // ----- PS-EXE sideload ------------------------------------------------------------------
@@ -431,9 +462,31 @@ fn run_sideload(cpu: &mut Cpu, exe_path: &str) {
         }
     }
 
-    // 4. Verdict.
+    // 4. Verdict. A `gpu/` test grades one of two ways: most print a pass/fail line to the kernel TTY
+    //    (checked against the sibling `psx.log`), but the pure-render tests instead ship a reference
+    //    VRAM image — for those we diff the framebuffer pixel-for-pixel. Use whichever reference is
+    //    present next to the EXE.
     let captured = cpu.bus.tty_out[tty_start..].to_string();
-    report_verdict(exe_path, &captured);
+    let vram_ref = std::path::Path::new(exe_path).with_file_name("vram.png");
+    if vram_ref.exists() {
+        if !captured.trim().is_empty() {
+            println!("\n----- captured TTY -----\n{captured}\n------------------------");
+        }
+        if diff_vram_vs_png(cpu.bus.gpu.vram(), &vram_ref.to_string_lossy()) {
+            println!("\n[verdict] VRAM MATCHES {} (pixel-exact)", vram_ref.display());
+        } else {
+            println!("\n[verdict] VRAM DIFFERS from {}", vram_ref.display());
+            // Dump what we actually produced so the failure is inspectable (and useful for the M4c/M4d
+            // stages that make these render tests pass for real).
+            let rgb = vram_to_rgb(cpu.bus.gpu.vram());
+            print_vram_ascii(&rgb);
+            let _ = std::fs::write("vram_dump.png", img::encode_rgb(VRAM_W as u32, VRAM_H as u32, &rgb));
+            println!("[verdict] wrote our VRAM to vram_dump.png for comparison");
+            std::process::exit(1);
+        }
+    } else {
+        report_verdict(exe_path, &captured);
+    }
 }
 
 /// Compare a program's captured TTY against the golden `psx.log` shipped alongside it in the
@@ -967,11 +1020,12 @@ fn run_selftest() -> bool {
             v[VRAM_W + 1] = 0x7FFF; // white
         }
         let rgb = vram_to_rgb(bus.gpu.vram());
-        // 5-bit 31 expands to 8-bit 255; the empty channels stay 0.
+        // 5-bit 31 expands to 8-bit 0xF8 (top-aligned — see `expand5`; the suite never reaches 0xFF);
+        // the empty channels stay 0.
         let px0 = (rgb[0] as u32) << 16 | (rgb[1] as u32) << 8 | rgb[2] as u32;
         let px1 = (rgb[3] as u32) << 16 | (rgb[4] as u32) << 8 | rgb[5] as u32;
-        check(&mut pass, "VRAM red -> 0xFF0000", px0, 0xFF_0000);
-        check(&mut pass, "VRAM green -> 0x00FF00", px1, 0x00_FF00);
+        check(&mut pass, "VRAM red -> 0xF80000", px0, 0xF8_0000);
+        check(&mut pass, "VRAM green -> 0x00F800", px1, 0x00_F800);
 
         // Encode then decode must return identical pixels and dimensions.
         let png = img::encode_rgb(VRAM_W as u32, VRAM_H as u32, &rgb);
@@ -983,6 +1037,55 @@ fn run_selftest() -> bool {
             }
             None => check(&mut pass, "PNG round-trip decodes", 0, 1),
         }
+    }
+
+    // ===== M4b: VRAM transfers (A0 / C0 / 02 fill) =====================================
+    // --- A0 CPU->VRAM upload, then C0 VRAM->CPU download, round-trips the same pixels ---
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(0xA000_0000); // CPU->VRAM
+        g.gp0((3 << 16) | 5); // destination (x=5, y=3)
+        g.gp0((1 << 16) | 2); // size 2 wide x 1 tall (2 pixels = 1 data word)
+        g.gp0(0x5678_1234); // packed pixels: low half 0x1234, high half 0x5678
+        g.gp0(0xC000_0000); // VRAM->CPU
+        g.gp0((3 << 16) | 5); // source (5, 3)
+        g.gp0((1 << 16) | 2); // size 2 x 1
+        check(&mut pass, "A0 upload -> C0 download round-trip", g.read(), 0x5678_1234);
+    }
+
+    // --- 02 fill, then read a filled pixel back via C0 --------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(0x0200_00FF); // fill, command colour 0x0000FF (R=0xFF) -> 15-bit 0x001F
+        g.gp0(0x0000_0000); // top-left (0, 0)
+        g.gp0((16 << 16) | 16); // size 16 x 16
+        g.gp0(0xC000_0000); // read pixel (0,0) back
+        g.gp0(0x0000_0000); // source (0, 0)
+        g.gp0((1 << 16) | 1); // size 1 x 1
+        check(&mut pass, "02 fill + read-back", g.read() & 0xFFFF, 0x001F);
+    }
+
+    // --- 80 VRAM->VRAM copy: upload, copy the block elsewhere, read the copy back -------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(0xA000_0000); // upload 2 pixels (0xABCD, 0x1357) ...
+        g.gp0(0x0000_0000); // ... to (0, 0)
+        g.gp0((1 << 16) | 2); // size 2 x 1
+        g.gp0(0x1357_ABCD);
+        g.gp0(0x8000_0000); // VRAM->VRAM copy ...
+        g.gp0(0x0000_0000); // source (0, 0)
+        g.gp0((5 << 16) | 10); // destination (10, 5)
+        g.gp0((1 << 16) | 2); // size 2 x 1
+        g.gp0(0xC000_0000); // read the copy back ...
+        g.gp0((5 << 16) | 10); // ... from (10, 5)
+        g.gp0((1 << 16) | 2); // size 2 x 1
+        check(&mut pass, "80 VRAM->VRAM copy round-trip", g.read(), 0x1357_ABCD);
     }
 
     println!(
