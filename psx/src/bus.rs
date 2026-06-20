@@ -122,6 +122,145 @@ impl Bus {
         }
     }
 
+    // ===== DMA engine (M4c) =============================================================
+    // The register file lives in `dma.rs`; the *transfer* lives here, because moving a block touches
+    // RAM, the GPU, and the interrupt controller at once and only the bus owns all three. A CHCR
+    // write that sets a channel's start bit (caught in `io_write`) is what kicks it off.
+    //
+    // We run a transfer to completion the instant it's armed — synchronous, no cycle budget, the same
+    // "always ready" simplification the GPU uses. Real hardware interleaves DMA with the CPU
+    // (chopping, bus arbitration); the seam to model that later is `tick`, exactly as on the DMG.
+
+    /// Direct RAM word access for DMA. **Not** `read32`/`write32`: those re-run the segment decode,
+    /// so a stray DMA pointer could hit an I/O register (or even re-enter the DMA window). DMA only
+    /// ever touches RAM, so index it straight — folding into the 2 MiB mirror and word-aligning.
+    fn ram_read32(&self, addr: u32) -> u32 {
+        le32(&self.ram[(addr & 0x1F_FFFC) as usize..])
+    }
+    fn ram_write32(&mut self, addr: u32, val: u32) {
+        put_le32(&mut self.ram[(addr & 0x1F_FFFC) as usize..], val);
+    }
+
+    /// Decide whether a just-written DMA register armed a channel, and if so run it. `dma_off` is the
+    /// byte offset within the DMA block; a channel's CHCR sits at `ch*0x10 + 0x8`.
+    fn dma_maybe_trigger(&mut self, dma_off: u32, chcr: u32) {
+        if dma_off & 0xF != 0x8 {
+            return; // not a CHCR write — MADR/BCR/DPCR don't start anything
+        }
+        let ch = (dma_off >> 4) as u8;
+        if ch > 6 || !self.dma.channel_enabled(ch) {
+            return; // unimplemented channel, or DPCR hasn't enabled this one
+        }
+        // The start condition depends on the sync mode: manual mode (0) waits for the explicit
+        // trigger (bit 28) alongside enable (bit 24); request/linked-list modes (1/2) start on
+        // enable alone. (Software often writes CHCR twice — config first, then the start bit — so a
+        // write that doesn't meet the condition must be a no-op, not a transfer.)
+        let sync = (chcr >> 9) & 3;
+        let enable = chcr & (1 << 24) != 0;
+        let trigger = chcr & (1 << 28) != 0;
+        if enable && (sync != 0 || trigger) {
+            self.run_dma(ch);
+        }
+    }
+
+    /// Run channel `ch` to completion, then clear its start bits and raise the DMA IRQ if armed.
+    fn run_dma(&mut self, ch: u8) {
+        // Copy the channel registers out as plain words first, so no borrow on `self.dma` is held
+        // while the transfer below borrows `self.ram` / `self.gpu`.
+        let chcr = self.dma.chan_chcr(ch);
+        let madr = self.dma.chan_madr(ch);
+        let bcr = self.dma.chan_bcr(ch);
+
+        let final_madr = if ch == 6 {
+            self.run_dma_otc(madr, bcr)
+        } else {
+            // Channel 2 (GPU): bit0 = direction (1 = RAM->GPU), bit1 = step, bits 9-10 = sync mode.
+            let from_ram = chcr & 1 != 0;
+            let step: i32 = if chcr & 2 != 0 { -4 } else { 4 };
+            match (chcr >> 9) & 3 {
+                2 => self.run_dma_linked_list(madr),
+                sync => self.run_dma_block(madr, bcr, sync, from_ram, step),
+            }
+        };
+
+        // Done: drop the busy/trigger bits so a CHCR poll sees idle, zero BCR's count, and store
+        // where MADR ended up (MADR is a 24-bit register). Then update the interrupt state.
+        self.dma.set_chan_chcr(ch, chcr & !((1 << 24) | (1 << 28)));
+        self.dma.set_chan_bcr(ch, bcr & 0xFFFF_0000);
+        self.dma.set_chan_madr(ch, final_madr & 0x00FF_FFFF);
+
+        if self.dma.signal_completion(ch) {
+            self.irq.raise(crate::irq::source::DMA);
+        }
+    }
+
+    /// Channel 2 block transfer — manual (sync 0) or request (sync 1). Both stream a flat run of
+    /// words between RAM and the GPU's GP0 port (RAM->GPU) or GPUREAD port (GPU->RAM); only the
+    /// word-count formula differs. Returns the final MADR.
+    fn run_dma_block(&mut self, mut madr: u32, bcr: u32, sync: u32, from_ram: bool, step: i32) -> u32 {
+        // 0 in any count field means the maximum (0x10000) — the canonical PS1 DMA quirk.
+        let max = |n: u32| if n == 0 { 0x1_0000 } else { n };
+        let words = if sync == 0 {
+            max(bcr & 0xFFFF) // manual: BCR is a plain word count
+        } else {
+            max(bcr & 0xFFFF) * max((bcr >> 16) & 0xFFFF) // request: block size x block count
+        };
+        for _ in 0..words {
+            if from_ram {
+                let w = self.ram_read32(madr);
+                self.gpu.gp0(w);
+            } else {
+                let w = self.gpu.read();
+                self.ram_write32(madr, w);
+            }
+            madr = madr.wrapping_add(step as u32);
+        }
+        madr
+    }
+
+    /// Channel 2 linked-list (sync 2) — always RAM->GP0. Walks a chain of packets the program built
+    /// in RAM: each node is a header word (`count << 24 | next_addr`) followed by `count` GP0 command
+    /// words. The list ends when a next-pointer has bit 23 set (conventionally `0x00FFFFFF`). This is
+    /// how the `gpu/` test ROMs (and real games) submit draw lists. Returns MADR's resting value.
+    fn run_dma_linked_list(&mut self, madr: u32) -> u32 {
+        let mut addr = madr & 0x1F_FFFC;
+        // Safety net: a malformed/cyclic list would loop forever here (unlike hardware, we have no
+        // cycle budget to let the CPU intervene). Cap node count well above any real display list.
+        for _ in 0..0x10_000 {
+            let header = self.ram_read32(addr);
+            let count = header >> 24;
+            for i in 1..=count {
+                let w = self.ram_read32(addr + i * 4);
+                self.gpu.gp0(w);
+            }
+            if header & 0x80_0000 != 0 {
+                break;
+            }
+            addr = header & 0x1F_FFFC;
+        }
+        0x00FF_FFFF
+    }
+
+    /// Channel 6 (OTC) — "ordering-table clear": fills RAM with a backward-linked chain of empty
+    /// nodes, the skeleton a game hangs its GP0 packets off of. Starting at MADR (the highest
+    /// address, the table head) it writes each entry with a pointer to the next-lower entry,
+    /// decrementing by 4, and terminates the lowest entry with `0x00FFFFFF`. OTC is hardwired — it
+    /// ignores CHCR's direction/sync fields. Returns the final MADR.
+    fn run_dma_otc(&mut self, madr: u32, bcr: u32) -> u32 {
+        let n = if bcr & 0xFFFF == 0 { 0x1_0000 } else { bcr & 0xFFFF };
+        let mut addr = madr & 0x1F_FFFC;
+        for i in 0..n {
+            let entry = if i == n - 1 {
+                0x00FF_FFFF // last (lowest) entry: the end-of-list marker
+            } else {
+                addr.wrapping_sub(4) & 0x00FF_FFFF // point at the next-lower node
+            };
+            self.ram_write32(addr, entry);
+            addr = addr.wrapping_sub(4);
+        }
+        addr
+    }
+
     // ===== Address decode ===============================================================
     fn decode(addr: u32) -> Region {
         let phys = addr & REGION_MASK[(addr >> 29) as usize];
@@ -225,6 +364,7 @@ impl Bus {
             0x060 => self.mem_control[0x18], // RAM_SIZE
             0x070 => self.irq.read_stat() as u32, // I_STAT
             0x074 => self.irq.read_mask() as u32, // I_MASK
+            0x0F4 => self.dma.dicr_read(),        // DICR: bit 31 (master flag) is computed, not stored
             0x080..=0x0FF => self.dma.read(offset - 0x080),
             0x100..=0x12F => 0, // timers (M4)
             0x810 => self.gpu.read(),    // GPUREAD
@@ -240,7 +380,13 @@ impl Bus {
             0x060 => self.mem_control[0x18] = val,
             0x070 => self.irq.ack(val as u16),
             0x074 => self.irq.write_mask(val as u16),
-            0x080..=0x0FF => self.dma.write(offset - 0x080, val),
+            0x0F4 => self.dma.dicr_write(val), // DICR: flag bits are write-1-to-clear (see dma.rs)
+            0x080..=0x0FF => {
+                // Latch the register, then — if this was a CHCR write that arms a channel — run it.
+                let dma_off = offset - 0x080;
+                self.dma.write(dma_off, val);
+                self.dma_maybe_trigger(dma_off, val);
+            }
             0x100..=0x12F => {} // timers (M4)
             0x810 => self.gpu.gp0(val),
             0x814 => self.gpu.gp1(val),

@@ -262,7 +262,7 @@ fn run_dump(cpu: &mut Cpu) {
         Ok(_) => println!("\n[dump] wrote {path}  ({VRAM_W}x{VRAM_H} VRAM, {} bytes)", png.len()),
         Err(e) => eprintln!("\n[dump] failed to write {path}: {e}"),
     }
-    println!("[dump] (VRAM stays black until the rasterizer lands in M4b/M4c.)");
+    println!("[dump] (VRAM stays black until the rasterizer lands in M4d.)");
 }
 
 /// Expand the full 1024x512 VRAM into a packed 24-bit RGB buffer (`VRAM_W*VRAM_H*3` bytes). This is
@@ -476,8 +476,8 @@ fn run_sideload(cpu: &mut Cpu, exe_path: &str) {
             println!("\n[verdict] VRAM MATCHES {} (pixel-exact)", vram_ref.display());
         } else {
             println!("\n[verdict] VRAM DIFFERS from {}", vram_ref.display());
-            // Dump what we actually produced so the failure is inspectable (and useful for the M4c/M4d
-            // stages that make these render tests pass for real).
+            // Dump what we actually produced so the failure is inspectable (and useful for the M4d
+            // rasterizer stage that makes these render tests pass for real).
             let rgb = vram_to_rgb(cpu.bus.gpu.vram());
             print_vram_ascii(&rgb);
             let _ = std::fs::write("vram_dump.png", img::encode_rgb(VRAM_W as u32, VRAM_H as u32, &rgb));
@@ -1086,6 +1086,90 @@ fn run_selftest() -> bool {
         g.gp0((5 << 16) | 10); // ... from (10, 5)
         g.gp0((1 << 16) | 2); // size 2 x 1
         check(&mut pass, "80 VRAM->VRAM copy round-trip", g.read(), 0x1357_ABCD);
+    }
+
+    // ===== M4c: DMA (channels 2 GPU + 6 OTC, and the DMA interrupt) ====================
+    // These drive the DMA through the real bus path: program MADR/BCR (and DPCR/DICR) via MMIO
+    // writes, then write CHCR last — the start bit in that write is what kicks the transfer. DMA
+    // runs synchronously, so the result is observable immediately afterward. (DMA addresses are
+    // physical RAM; we use plain KUSEG addresses like 0x1000, which decode straight to RAM.)
+
+    // --- channel 6 (OTC): clears a backward-linked ordering table in RAM --------------
+    {
+        let mut bus = Bus::new();
+        // A channel won't start unless DPCR enables it: bit (ch*4+3), so ch6 -> bit 27.
+        bus.write32(0x1F80_10F0, 0x0765_4321 | (1 << 27));
+        bus.write32(0x1F80_10E0, 0x0000_1000); // ch6 MADR = table head (highest address)
+        bus.write32(0x1F80_10E4, 4); // ch6 BCR = 4 entries
+        bus.write32(0x1F80_10E8, 0x1100_0002); // ch6 CHCR = start(24) | manual-trigger(28) | step-down(1)
+        // The head points one entry down; each entry links downward; the lowest entry terminates.
+        check(&mut pass, "OTC head -> head-4", bus.read32(0x1000), 0x0000_0FFC);
+        check(&mut pass, "OTC chain link", bus.read32(0x0FFC), 0x0000_0FF8);
+        check(&mut pass, "OTC end marker (0xFFFFFF)", bus.read32(0x0FF4), 0x00FF_FFFF);
+        // The start bits must self-clear once the transfer completes.
+        let chcr = bus.read32(0x1F80_10E8);
+        check(&mut pass, "OTC CHCR start bits cleared", chcr & ((1 << 24) | (1 << 28)), 0);
+    }
+
+    // --- channel 2 (GPU) linked-list: walk a packet chain, feed each word to GP0 -------
+    // This is the keystone path: build an A0 (CPU->VRAM) upload as a one-node display list in RAM,
+    // DMA it through GP0, then read the pixel back with a direct C0 download.
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_10F0, 0x0765_4321 | (1 << 11)); // enable ch2 (bit 2*4+3 = 11)
+        bus.gpu.gp1(0x0000_0000); // reset GPU
+        bus.gpu.gp1(0x0400_0002); // GP1(04) DMA direction = CPU->GP0 (documents the real handshake)
+        bus.write32(0x1000, (4 << 24) | 0x00FF_FFFF); // node header: 4 payload words, then end-of-list
+        bus.write32(0x1004, 0xA000_0000); // GP0 A0: CPU->VRAM upload
+        bus.write32(0x1008, 0x0000_0000); // destination (0, 0)
+        bus.write32(0x100C, (1 << 16) | 1); // size 1 x 1 -> one pixel -> one data word
+        bus.write32(0x1010, 0x0000_ABCD); // the pixel (low half used)
+        bus.write32(0x1F80_10A0, 0x0000_1000); // ch2 MADR = list head
+        bus.write32(0x1F80_10A8, 0x0100_0401); // ch2 CHCR = start(24) | sync 2 linked-list (bit10) | RAM->dev (bit0)
+        // Read pixel (0,0) back through a direct C0 download.
+        bus.gpu.gp0(0xC000_0000);
+        bus.gpu.gp0(0x0000_0000); // source (0, 0)
+        bus.gpu.gp0((1 << 16) | 1); // size 1 x 1
+        check(&mut pass, "DMA linked-list feeds GP0 (A0)", bus.gpu.read() & 0xFFFF, 0xABCD);
+    }
+
+    // --- channel 2 (GPU) block mode: stream GPUREAD into RAM ----------------------------
+    // Fill a VRAM block, latch a C0 download, then DMA the GPUREAD stream into RAM (device->RAM).
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_10F0, 0x0765_4321 | (1 << 11)); // enable ch2
+        bus.gpu.gp1(0x0000_0000);
+        bus.gpu.gp0(0x0200_00FF); // 02 fill, command colour 0x0000FF (R=0xFF) -> 15-bit pixel 0x001F
+        bus.gpu.gp0(0x0000_0000); // top-left (0, 0)
+        bus.gpu.gp0((16 << 16) | 16); // 16 x 16 (fill snaps to 16-pixel units)
+        bus.gpu.gp0(0xC000_0000); // latch a VRAM->CPU download ...
+        bus.gpu.gp0(0x0000_0000); // ... source (0, 0)
+        bus.gpu.gp0((1 << 16) | 2); // size 2 x 1 -> two pixels -> one word
+        bus.write32(0x1F80_10A0, 0x0000_2000); // ch2 MADR = 0x2000
+        bus.write32(0x1F80_10A4, (1 << 16) | 1); // ch2 BCR = 1 block x 1 word
+        bus.write32(0x1F80_10A8, 0x0100_0200); // ch2 CHCR = start(24) | sync 1 request (bit9) | device->RAM (bit0=0)
+        let p: u32 = 0x001F; // the filled pixel; two of them pack into one word
+        check(&mut pass, "DMA block GPUREAD->RAM", bus.read32(0x2000), p | (p << 16));
+    }
+
+    // --- the DMA interrupt: completion -> DICR flag -> I_STAT bit 3 ---------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1074, 0x0000_FFFF); // I_MASK: allow all sources (incl. DMA, bit 3)
+        bus.write32(0x1F80_10F0, 0x0765_4321 | (1 << 27)); // enable DMA channel 6
+        bus.write32(0x1F80_10F4, (1 << 23) | (1 << 22)); // DICR: master enable (23) + ch6 IRQ enable (16+6)
+        bus.write32(0x1F80_10E0, 0x0000_1000); // OTC MADR
+        bus.write32(0x1F80_10E4, 2); // 2 entries
+        bus.write32(0x1F80_10E8, 0x1100_0002); // CHCR start -> transfer completes -> raise the IRQ
+        check(&mut pass, "DMA completion -> I_STAT bit 3", (bus.read32(0x1F80_1070) >> 3) & 1, 1);
+        check(&mut pass, "DICR ch6 flag set (bit 30)", (bus.read32(0x1F80_10F4) >> 30) & 1, 1);
+        check(&mut pass, "DICR master flag set (bit 31)", (bus.read32(0x1F80_10F4) >> 31) & 1, 1);
+        // Acknowledge: I_STAT is write-0-to-clear; DICR flags are write-1-to-clear (opposite!).
+        bus.write32(0x1F80_1070, !(1 << 3)); // clear I_STAT bit 3
+        check(&mut pass, "I_STAT bit 3 acknowledged", (bus.read32(0x1F80_1070) >> 3) & 1, 0);
+        bus.write32(0x1F80_10F4, (1 << 23) | (1 << 22) | (1 << 30)); // write 1 to clear ch6 flag; keep enables
+        check(&mut pass, "DICR ch6 flag cleared", (bus.read32(0x1F80_10F4) >> 30) & 1, 0);
+        check(&mut pass, "DICR master flag cleared", (bus.read32(0x1F80_10F4) >> 31) & 1, 0);
     }
 
     println!(

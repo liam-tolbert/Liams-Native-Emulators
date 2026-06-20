@@ -27,7 +27,7 @@
 //!
 //! A single GP0 *command* is several words long — a flat triangle is 4 words (a colour, then three
 //! XY vertices), a Gouraud-shaded textured quad is 11. But the CPU writes the port **one 32-bit word
-//! at a time**, and later (M4d) the DMA engine will dribble those same words in independently. So
+//! at a time**, and (as of M4c) the DMA engine dribbles those same words in independently. So
 //! the GPU can't treat each write as a whole command: it must remember a *partial* command across
 //! writes — read the first word to learn which command and how many words it needs, accumulate that
 //! many, then execute. That accumulate-then-fire logic is the heart of this file (`gp0`).
@@ -39,8 +39,8 @@
 //! **draws nothing** — every rendering and image-transfer command is *parsed* (so the FIFO stays in
 //! sync) but its executor is a stub. The pixel work lands in later stages:
 //!   * M4b — VRAM transfers & fill (`02`, `A0`, `C0`, `80`).
-//!   * M4c — the software rasterizer (polygons, rectangles, lines).
-//!   * M4d — DMA channels that feed GP0 without the CPU.
+//!   * M4c — DMA channels 2 (GPU) + 6 (OTC) that feed GP0/VRAM without the CPU.
+//!   * M4d — the software rasterizer (polygons, rectangles, lines).
 //!   * M4e — display timing (VBlank) and the on-screen window.
 //! The draw-*state* commands (`E1`-`E6`) and the GP1 knobs are fully modelled now, because GPUSTAT is
 //! assembled from them and later stages will read them straight back.
@@ -74,12 +74,12 @@ pub struct Gpu {
     /// terminator word arrives. Polylines have no fixed length, so they can't use `gp0_remaining`.
     gp0_polyline: bool,
 
-    // ===== draw state (set by GP0 E1-E6; read back by the rasterizer in M4c) =============
+    // ===== draw state (set by GP0 E1-E6; read back by the rasterizer in M4d) =============
     /// GP0(E1) "draw mode": texture-page base, semi-transparency mode, texture colour depth,
     /// dither enable, draw-to-display-area flag, texture-disable, rectangle texture flips. We keep
     /// the low 14 bits verbatim because GPUSTAT bits 0-10 and 15 are taken straight from them.
     draw_mode: u32,
-    /// GP0(E2) texture window (mask/offset, in 8-pixel units). Stored for M4c texture sampling.
+    /// GP0(E2) texture window (mask/offset, in 8-pixel units). Stored for M4d texture sampling.
     tex_window: u32,
     /// GP0(E3/E4) clipping rectangle — the rasterizer must not draw outside it.
     draw_area_left: u16,
@@ -190,7 +190,7 @@ impl Gpu {
         &self.vram
     }
     /// Mutable VRAM, used only by the M4a self-test to poke a known pattern for harness calibration.
-    /// The drawing commands that fill VRAM for real arrive in M4b/M4c.
+    /// The drawing commands that fill VRAM for real arrive in M4b (transfers) and M4d (rasterizer).
     pub fn vram_mut(&mut self) -> &mut [u16] {
         &mut self.vram
     }
@@ -198,7 +198,7 @@ impl Gpu {
     /// Write one pixel. **Gotcha: VRAM coordinates wrap** — VRAM is a fixed 1024x512 torus, and the
     /// hardware silently masks X to 0..1023 and Y to 0..511 rather than faulting. A primitive whose
     /// offset pushes it off the right edge reappears on the left, so the wrap is behaviour to
-    /// reproduce, not an error to guard against. (Used by M4b/M4c; here so the rule lives in one spot.)
+    /// reproduce, not an error to guard against. (Used by M4b onward; here so the rule lives in one spot.)
     fn vram_set(&mut self, x: i32, y: i32, color: u16) {
         let x = (x as usize) & (VRAM_W - 1); // & 1023  (VRAM_W is a power of two)
         let y = (y as usize) & (VRAM_H - 1); // & 511
@@ -252,7 +252,7 @@ impl Gpu {
         s |= 1 << 28;
 
         // Bit 25 — the DMA / data request line. **Gotcha:** its meaning depends on the GP1(04) DMA
-        // direction, and the DMA controller (M4d) polls it to decide whether the GPU wants a block.
+        // direction, and the DMA controller (M4c) polls it to decide whether the GPU wants a block.
         // If we left it 0 the GPU-DMA channel would never fire. Mirror the matching ready bit per
         // direction: FIFO -> cmd-ready (26), CPU->GP0 -> dma-block-ready (28), GPUREAD->CPU ->
         // vram-send-ready (27); "off" requests nothing.
@@ -329,7 +329,7 @@ impl Gpu {
         // --- mid polyline: drain vertices/colours until the terminator word --------------------
         // A polyline (`48`-`5F` with bit 3 set) sends an arbitrary number of points and ends with a
         // sentinel word matching `0x5xxx_5xxx`. Its length isn't known up front, so it gets its own
-        // drain mode instead of a `gp0_remaining` count. (M4a only drops it; M4c renders it. The
+        // drain mode instead of a `gp0_remaining` count. (M4a only drops it; M4d renders it. The
         // terminator test is intentionally loose here — good enough until a real polyline is drawn.)
         if self.gp0_polyline {
             if word & 0xF000_F000 == 0x5000_5000 {
@@ -496,7 +496,7 @@ impl Gpu {
             }
             0x1F => self.irq = true,    // request a GPU interrupt (GPUSTAT bit 24)
 
-            // --- draw-state settings (fully modelled now; the rasterizer reads these in M4c) -----
+            // --- draw-state settings (fully modelled now; the rasterizer reads these in M4d) -----
             0xE1 => self.draw_mode = w0 & 0x3FFF, // texpage / semi-transp / depth / dither / flips
             0xE2 => self.tex_window = w0 & 0x000F_FFFF,
             0xE3 => {
@@ -519,7 +519,7 @@ impl Gpu {
                 self.check_mask = w0 & 2 != 0;
             }
 
-            // --- rendering primitives — parsed-and-dropped until M4c ----------------------------
+            // --- rendering primitives — parsed-and-dropped until M4d ----------------------------
             0x20..=0x3F => { /* polygon */ }
             0x40..=0x5F => { /* line (non-polyline; polylines drain in gp0) */ }
             0x60..=0x7F => { /* rectangle / sprite */ }
