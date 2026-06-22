@@ -12,7 +12,8 @@
 //! unaligned LWL/LWR pair). The remaining modes still point at the milestone that fills them:
 //!   * `<N>`      single-step register trace            -> M1 (this milestone)
 //!   * `selftest` run the built-in CPU self-test        -> M1 (this milestone)
-//!   * `dump`     headless GPU frame thumbnail          -> M4 (GPU)
+//!   * `window`   open a window and run (BIOS-logo demo)-> M4e (display timing + window)
+//!   * `dump [N]` headless: run N frames -> VRAM PNG    -> M4 (GPU)
 //!   * `<exe>`    sideload a PS-EXE and run to a verdict -> M3 (boot + TTY harness)
 //!   * (none)     boot the BIOS headless, echoing TTY    -> M3
 //!
@@ -54,10 +55,11 @@ fn main() {
         let me = &args[0];
         eprintln!("Usage:");
         eprintln!("  {me} <bios.bin>             boot the BIOS headless, echo TTY      [M3]");
+        eprintln!("  {me} <bios.bin> window      open a window, run (BIOS-logo demo)   [M4e]");
         eprintln!("  {me} <bios.bin> <N>         single-step N instructions w/ trace   [M1]");
         eprintln!("  {me} selftest              run the built-in CPU self-test        [M1]");
         eprintln!("  {me} <bios.bin> <game.exe>  sideload a PS-EXE, run to a verdict    [M3]");
-        eprintln!("  {me} <bios.bin> dump        headless GPU frame thumbnail          [M4]");
+        eprintln!("  {me} <bios.bin> dump [N]    headless: run N frames -> VRAM PNG     [M4]");
         std::process::exit(1);
     }
 
@@ -111,7 +113,13 @@ fn main() {
                 selftest::run_selftest();
             }
         }
-        Some("dump") => run_dump(&mut cpu),
+        Some("window") => run_window(&mut cpu),
+        Some("dump") => {
+            // Optional frame count (default 120): how many VBlank-driven frames to run after the
+            // hand-off so the BIOS's boot animation actually paints before we snapshot.
+            let frames = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(120);
+            run_dump(&mut cpu, frames);
+        }
         Some(other) => {
             run_sideload(&mut cpu, other);
         }
@@ -242,14 +250,18 @@ fn run_bios_boot(cpu: &mut Cpu) {
 pub(crate) const VRAM_W: usize = 1024;
 pub(crate) const VRAM_H: usize = 512;
 
-/// `dump` run-mode: boot the BIOS (so anything it draws is in VRAM), then snapshot VRAM to a PNG and
-/// print an ASCII thumbnail. In M4a nothing is rasterized yet — a black frame here is expected and
-/// correct; the pipeline (VRAM -> RGB -> PNG) is what's being exercised.
-fn run_dump(cpu: &mut Cpu) {
+/// `dump` run-mode: boot the BIOS, run `frames` VBlank-driven frames so its boot animation actually
+/// paints (the Sony logo is drawn *after* the hand-off, one step per VBlank), then snapshot VRAM to a
+/// PNG + ASCII thumbnail. The window-free way to capture the rendered frame for a screenshot.
+fn run_dump(cpu: &mut Cpu, frames: u32) {
     if cpu.bus.bios_loaded() {
         cpu.capture_tty = true;
         println!("\n[dump] booting BIOS to 0x{EXEC_POINT:08X} before snapshotting VRAM ...\n");
         let _ = run_until_pc(cpu, EXEC_POINT, BOOT_BUDGET);
+        if frames > 0 {
+            println!("\n[dump] running {frames} frames so the VBlank-driven boot animation advances ...");
+            run_frames(cpu, frames);
+        }
     } else {
         println!("\n[dump] no BIOS loaded — dumping the (empty) power-on VRAM.");
     }
@@ -263,7 +275,79 @@ fn run_dump(cpu: &mut Cpu) {
         Ok(_) => println!("\n[dump] wrote {path}  ({VRAM_W}x{VRAM_H} VRAM, {} bytes)", png.len()),
         Err(e) => eprintln!("\n[dump] failed to write {path}: {e}"),
     }
-    println!("[dump] (VRAM stays black until the rasterizer lands in M4d.)");
+}
+
+/// Step the CPU until `n` whole frames have elapsed — each frame ends when the GPU trips VBlank
+/// (`take_frame`). A per-frame step guard keeps a wedged machine from hanging the run.
+fn run_frames(cpu: &mut Cpu, n: u32) {
+    for _ in 0..n {
+        let mut guard = 0u32;
+        while !cpu.bus.gpu.take_frame() {
+            cpu.step();
+            guard += 1;
+            if guard > 5_000_000 {
+                return;
+            }
+        }
+    }
+}
+
+/// `window` run-mode (M4e): open a real window and run the machine at ~60 Hz, blitting the GPU's
+/// visible framebuffer each frame. The demo is the BIOS booting to its **Sony Computer Entertainment
+/// logo** on screen — GPU-drawn, animated by the VBlank loop, no game or CD-ROM needed. Mirrors the
+/// Game Boy host shell's window loop. No controller input yet (the PS1 pads are M5+); Esc / closing
+/// the window quits.
+fn run_window(cpu: &mut Cpu) {
+    use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
+    use std::time::{Duration, Instant};
+
+    if !cpu.bus.bios_loaded() {
+        eprintln!("\n(no BIOS loaded — supply a 512 KiB BIOS image to open a window)");
+        std::process::exit(1);
+    }
+    cpu.capture_tty = true; // keep echoing the boot TTY to the terminal
+
+    // One fixed 640x480 canvas (the largest PS1 mode). minifb letterboxes each frame's live buffer
+    // into it via AspectRatioStretch, so the BIOS starting blanked and switching resolution mid-run
+    // needs no window recreation, and a 256x240 splash keeps its aspect instead of smearing.
+    let mut window = Window::new(
+        "PlayStation 1  —  [Esc] to quit",
+        640,
+        480,
+        WindowOptions {
+            scale: Scale::X1,
+            scale_mode: ScaleMode::AspectRatioStretch,
+            ..WindowOptions::default()
+        },
+    )
+    .expect("failed to create window");
+
+    let frame_time = Duration::from_micros(16_666); // ~60 Hz, paced against the wall clock
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        let frame_start = Instant::now();
+
+        // Run one emulated frame: step until the GPU trips VBlank. The guard stops a wedged machine
+        // from freezing the window (normally it breaks the instant a frame completes).
+        let mut guard = 0u32;
+        while !cpu.bus.gpu.take_frame() {
+            cpu.step();
+            guard += 1;
+            if guard > 5_000_000 {
+                break;
+            }
+        }
+
+        let (w, h, buf) = cpu.bus.gpu.display_frame();
+        window
+            .update_with_buffer(&buf, w, h)
+            .expect("failed to update window");
+
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_time {
+            std::thread::sleep(frame_time - elapsed);
+        }
+    }
 }
 
 /// Expand the full 1024x512 VRAM into a packed 24-bit RGB buffer (`VRAM_W*VRAM_H*3` bytes). This is

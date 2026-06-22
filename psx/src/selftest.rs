@@ -1011,6 +1011,30 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "check-mask skips blend", px(g, 100, 100), 0xA94A);
     }
 
+    // ===== M4e: display timing (VBlank) ================================================
+    // Drive the bus's catch-up `tick` directly (no CPU) and watch the GPU trip a frame: VBlank should
+    // hit `I_STAT` bit 0 exactly when the cycle accumulator crosses CPU_CYCLES_PER_FRAME, the
+    // `frame_ready` flag should latch (and clear on read), and GPUSTAT bit 31 (the interlace field)
+    // should toggle once per frame.
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1074, 0x0000_FFFF); // I_MASK: allow all sources (incl. VBlank, bit 0)
+        let field_before = (bus.gpu.status() >> 31) & 1;
+
+        // One cycle short of a frame: no VBlank, no frame yet.
+        bus.tick(gpu::CPU_CYCLES_PER_FRAME - 1);
+        check(&mut pass, "no VBlank before frame boundary", (bus.read32(0x1F80_1070) >> 0) & 1, 0);
+        check(&mut pass, "no frame before boundary", bus.gpu.take_frame() as u32, 0);
+
+        // Crossing the boundary raises VBlank, latches the frame, and flips the field.
+        bus.tick(2);
+        check(&mut pass, "VBlank raised at frame boundary", bus.read32(0x1F80_1070) & 1, 1);
+        let field_after = (bus.gpu.status() >> 31) & 1;
+        check(&mut pass, "GPUSTAT field bit toggled", field_before ^ field_after, 1);
+        check(&mut pass, "frame_ready latched", bus.gpu.take_frame() as u32, 1);
+        check(&mut pass, "frame_ready clears on read", bus.gpu.take_frame() as u32, 0);
+    }
+
     println!(
         "\n[CPU self-test] {}",
         if pass { "ALL PASSED" } else { "FAILURES ABOVE" }

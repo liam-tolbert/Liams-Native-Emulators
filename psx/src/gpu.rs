@@ -51,6 +51,12 @@ use std::cell::Cell;
 const VRAM_W: usize = 1024;
 const VRAM_H: usize = 512;
 
+/// CPU cycles per video frame: the ~33.8688 MHz R3000 clock / ~60 Hz NTSC ≈ 564,480. **Approximate
+/// by design** — our per-instruction cycle model is coarse, and the host window paces to a real-time
+/// 60 Hz anyway, so this only sets *how many instructions run between VBlanks*, not the wall-clock
+/// rate. Exposed `pub(crate)` so the self-test can pin the boundary without hard-coding it twice.
+pub(crate) const CPU_CYCLES_PER_FRAME: u32 = 564_480;
+
 pub struct Gpu {
     /// The 1 MiB of video RAM, row-major (`y * 1024 + x`). Heap-allocated as a `Vec` rather than a
     /// `[u16; 524288]` so constructing the GPU never parks a 1 MiB array on the stack (a real
@@ -133,6 +139,18 @@ pub struct Gpu {
     /// 15/24-bit colour, interlace, the "reverse" flag. Scattered into GPUSTAT bits 14 and 16-22.
     display_mode: u32,
 
+    // ===== display timing (M4e) =========================================================
+    // Free-running, the way real hardware keeps time: `tick` (called from `bus.tick` every CPU
+    // instruction) accumulates cycles and trips a VBlank once per frame. Deliberately *not* reset by
+    // GP1(00) — a GP-port command can't stop the video clock.
+    /// CPU cycles accumulated toward the next frame boundary.
+    cycle_acc: u32,
+    /// Set true at each frame boundary; the host window loop drains it (`take_frame`) to know when to
+    /// blit. The analog of the DMG PPU's `frame_ready`.
+    frame_ready: bool,
+    /// Interlace field flag, toggled once per frame → GPUSTAT bit 31 (the "drawing odd/even line").
+    field_odd: bool,
+
     /// The staged GPUREAD response (answer to a GP1(10) "GPU info" request; VRAM read-back is M4b).
     gpuread: u32,
     /// The GPU's own interrupt request (GP0(1F) raises it, GP1(02) acknowledges it). GPUSTAT bit 24;
@@ -195,6 +213,9 @@ impl Gpu {
             display_v1: 0,
             display_v2: 0,
             display_mode: 0,
+            cycle_acc: 0,
+            frame_ready: false,
+            field_odd: false,
             gpuread: 0,
             irq: false,
             up_x: 0,
@@ -219,6 +240,79 @@ impl Gpu {
     /// The drawing commands that fill VRAM for real arrive in M4b (transfers) and M4d (rasterizer).
     pub fn vram_mut(&mut self) -> &mut [u16] {
         &mut self.vram
+    }
+
+    // ===== display timing + readout (M4e) ===============================================
+
+    /// Advance the video clock by `cycles` CPU cycles (called from `bus.tick`). Returns `true` once
+    /// per frame, on the cycle that crosses a frame boundary — the bus turns that into the VBlank IRQ.
+    /// We loop (not a single `if`) so an unusually long step can't swallow a boundary.
+    pub fn tick(&mut self, cycles: u32) -> bool {
+        self.cycle_acc += cycles;
+        let mut vblank = false;
+        while self.cycle_acc >= CPU_CYCLES_PER_FRAME {
+            self.cycle_acc -= CPU_CYCLES_PER_FRAME;
+            self.frame_ready = true;
+            self.field_odd = !self.field_odd; // GPUSTAT bit 31 — the interlace field flips per frame
+            vblank = true;
+        }
+        vblank
+    }
+
+    /// Read-and-clear the "a frame just finished" flag. The host window loop calls this to decide when
+    /// to blit; clearing here keeps the signal from being consumed twice.
+    pub fn take_frame(&mut self) -> bool {
+        let ready = self.frame_ready;
+        self.frame_ready = false;
+        ready
+    }
+
+    /// The visible resolution, decoded from the GP1(08) display-mode byte. Horizontal: bit 6 selects
+    /// the odd 368-pixel mode, else bits 0-1 pick 256/320/512/640. Vertical: bit 2 selects 480 (only
+    /// meaningful interlaced), else 240.
+    fn display_resolution(&self) -> (usize, usize) {
+        let dm = self.display_mode;
+        let w = if (dm >> 6) & 1 != 0 {
+            368
+        } else {
+            match dm & 3 {
+                0 => 256,
+                1 => 320,
+                2 => 512,
+                _ => 640,
+            }
+        };
+        let h = if (dm >> 2) & 1 != 0 { 480 } else { 240 };
+        (w, h)
+    }
+
+    /// Snapshot the on-screen image as `(width, height, pixels)` where each pixel is `0x00RRGGBB` for
+    /// `minifb`. The window starts at `(display_vram_x, display_vram_y)` in VRAM; `vram_get` wraps the
+    /// 1024x512 torus exactly like the video DAC. When the display is blanked (GP1(03)) we still return
+    /// a correctly-sized black frame (minifb needs non-zero dims). 24-bit display mode is deferred —
+    /// the BIOS splash is 15-bit, so we always read 5-5-5 here.
+    pub fn display_frame(&self) -> (usize, usize, Vec<u32>) {
+        let (w, h) = self.display_resolution();
+        let mut buf = vec![0u32; w * h];
+        if self.display_disabled {
+            return (w, h, buf);
+        }
+        for row in 0..h {
+            for col in 0..w {
+                let px = self.vram_get(
+                    self.display_vram_x as i32 + col as i32,
+                    self.display_vram_y as i32 + row as i32,
+                );
+                // 5-5-5 little-endian, red in the low bits — expand each 5-bit field to 8 (`v << 3`,
+                // the same top-aligned calibration as the PNG harness). **Gotcha:** red is the VRAM-low
+                // field but the output-*high* byte; swap them and the whole frame goes blue-for-red.
+                let r = ((px & 0x1F) << 3) as u32;
+                let g = (((px >> 5) & 0x1F) << 3) as u32;
+                let b = (((px >> 10) & 0x1F) << 3) as u32;
+                buf[row * w + col] = (r << 16) | (g << 8) | b;
+            }
+        }
+        (w, h, buf)
     }
 
     /// Write one pixel. **Gotcha: VRAM coordinates wrap** — VRAM is a fixed 1024x512 torus, and the
@@ -375,10 +469,10 @@ impl Gpu {
         };
         s |= dma_req << 25;
 
-        // Bits 29-30 echo the DMA direction back. Bit 31 (drawing even/odd interlace line) is driven
-        // by the display timing in M4e; left 0 here, exactly as the M3 stub left it (boot doesn't
-        // depend on it).
+        // Bits 29-30 echo the DMA direction back. Bit 31 is the interlace field ("drawing odd/even
+        // line"), flipped once per frame by `tick` (M4e); games poll it to sync to the field.
         s |= (self.dma_direction as u32) << 29;
+        s |= (self.field_odd as u32) << 31;
 
         s
     }

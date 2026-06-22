@@ -108,9 +108,15 @@ impl Bus {
         let _ = std::io::stdout().flush();
     }
 
-    /// Advance the time-based subsystems (M4+: timers, GPU, DMA). The "catch-up" seam is
-    /// here exactly as on the DMG; for the foundation milestones there's nothing to tick.
-    pub fn tick(&mut self, _cycles: u32) {}
+    /// Advance the time-based subsystems by `cycles` CPU cycles (the "catch-up" seam, called from
+    /// `cpu.step` after every instruction — exactly the DMG shape). The GPU keeps the video clock; when
+    /// it crosses a frame boundary it asks for the **VBlank** interrupt, which the BIOS/games service to
+    /// run their per-frame loop. (Root counters/timers will hang off here too, in M4.5.)
+    pub fn tick(&mut self, cycles: u32) {
+        if self.gpu.tick(cycles) {
+            self.irq.raise(crate::irq::source::VBLANK);
+        }
+    }
 
     // ===== Direct RAM access (used by the PS-EXE sideloader to inject an image) =========
     pub fn store_ram(&mut self, addr: u32, bytes: &[u8]) {
