@@ -28,6 +28,8 @@ target/
 /psx/PLAN.txt
 
 # VRAM / screen snapshots written by the psx `dump` run-mode
+vram_dump.png
+screen.png
 /HANDOFF.md
 /CLAUDE.md
 /docs
