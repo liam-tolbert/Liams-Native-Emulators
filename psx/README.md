@@ -4,16 +4,15 @@ A from-scratch PlayStation 1 (MIPS R3000A) emulator in Rust — the third and mo
 emulator in this collection, and the current focus. It is built clean-room from primary
 hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) and test ROMs.
 
-> **Status: M3 — BIOS boot & PS-EXE test harness.** The emulator now runs real software. It boots
-> the actual PS1 BIOS headless to the shell hand-off point (`0x80030000`) — the kernel banner comes
-> out through a TTY hook that snoops `std_out_putchar` at the BIOS call vectors — and then
-> *sideloads* a PS-EXE: it injects the program at the hand-off, sets PC/GP/SP the way the BIOS
-> loader would, runs it, and diffs the captured TTY against the test's golden `psx.log`. The
-> JaCzekanski `ps1-tests` **`cpu/cop`** test passes (matches its reference log); reaching that also
-> fixed a real coprocessor bug — coprocessor ops are now gated on the `SR.CU` "usable" bits instead
-> of always faulting. M4 (the GPU) is now underway: **M4a** (VRAM + GP0/GP1 model + GPUSTAT + the PNG
-> verify harness) and **M4b** (VRAM transfer & fill commands) are done; **DMA is next** — the keystone
-> the test ROMs feed their GPU commands through — then the rasterizer (see the M4 plan below).
+> **Status: M4 — GPU.** The emulator boots the actual PS1 BIOS headless to the shell hand-off point
+> (`0x80030000`) — the kernel banner comes out through a TTY hook that snoops `std_out_putchar` at the
+> BIOS call vectors — and *sideloads* a PS-EXE: it injects the program at the hand-off, sets PC/GP/SP
+> the way the BIOS loader would, runs it, and diffs the captured TTY against the test's golden
+> `psx.log` (the JaCzekanski `ps1-tests` **`cpu/cop`** test passes). The GPU is now well underway:
+> **M4a** (VRAM + GP0/GP1 model + GPUSTAT + the PNG verify harness), **M4b** (VRAM transfer & fill
+> commands), and **M4c** (DMA channels 2 + 6 + the DMA interrupt — `dma/otc-test` passes) are done.
+> **Next is the rasterizer (M4d)** — the GP0 drawing primitives that turn those DMA-delivered command
+> lists into pixels (see the M4 plan below).
 
 ## Roadmap
 
@@ -26,8 +25,8 @@ hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) 
 | **M4** | **GPU → first rendered frame** (built in the stages M4a–M4e below) | in progress |
 | ↳ M4a | VRAM + GP0/GP1 command model + real GPUSTAT + the PNG verify harness | **done** |
 | ↳ M4b | VRAM transfer & fill commands (`02` / `A0` / `C0` / `80`) | **done** |
-| ↳ M4c | DMA channels 2 (GPU) + 6 (OTC) + the DMA interrupt | next |
-| ↳ M4d | software rasterizer (polygons, rectangles, lines, textures) | later |
+| ↳ M4c | DMA channels 2 (GPU) + 6 (OTC) + the DMA interrupt | **done** |
+| ↳ M4d | software rasterizer (polygons, rectangles, lines, textures) | next |
 | ↳ M4e | display timing (VBlank) + the `minifb` window → BIOS-logo demo | later |
 | **M4.5** | Root counters / timers (TIMER0/1/2) | later |
 | M5+ | GTE, CD-ROM, SPU audio, controllers, then a dynamic recompiler (JIT) | later |
@@ -52,13 +51,15 @@ M4 is built in five stages, each planned and implemented on its own so the diff 
   so they reference-validate once M4c lands. (The PNG reader is now the `png` crate, so the harness
   reads the suite's compressed references; the 5→8-bit colour expansion is calibrated to the suite's
   top-aligned form.)
-- **M4c — DMA (next).** Channels 2 (GPU) and 6 (OTC) — including the linked-list display lists real
+- **M4c — DMA (done).** Channels 2 (GPU) and 6 (OTC) — including the linked-list display lists real
   games *and the test ROMs* submit frames through — plus the DMA interrupt. This is the keystone:
   every `gpu/` ROM drives the GPU via DMA, so it's what makes the M4b transfers (and then the M4d
   rasterizer) validate against the reference images. (Moved ahead of the rasterizer for exactly this
   reason — discovered during M4b that the ROMs never touch the GP0 port directly.)
-- **M4d — the software rasterizer** (flat/Gouraud/textured polygons, rectangles/sprites, lines; plus
-  semi-transparency, dithering, and the mask bit).
+- **M4d — the software rasterizer (next)** (flat/Gouraud/textured polygons, rectangles/sprites, lines;
+  plus semi-transparency, dithering, and the mask bit). Built in its own sub-stages: **M4d-1** the
+  untextured primitives (polygons, rectangles, lines + the shared clip/offset/mask/dither pipeline),
+  then textures, then semi-transparency.
 - **M4e — display timing + window**: the ~60 Hz VBlank tick that drives game loops, and a `minifb`
   window. Demo target: the real BIOS booting to its **Sony Computer Entertainment logo** on screen —
   that logo is GPU-drawn, so a correct M4 renders it with no game or CD-ROM needed.

@@ -609,6 +609,31 @@ fn check(pass: &mut bool, name: &str, got: u32, want: u32) {
     *pass &= ok;
 }
 
+/// Read one VRAM pixel back through a `C0` download — the rasterizer self-tests' eyeball into what
+/// actually landed in VRAM. Issues a fresh `C0` each call so the read cursor resets to the requested
+/// pixel; the returned value includes the mask bit (15).
+fn px(g: &mut gpu::Gpu, x: u32, y: u32) -> u32 {
+    g.gp0(0xC000_0000);
+    g.gp0((y << 16) | x);
+    g.gp0((1 << 16) | 1);
+    g.read() & 0xFFFF
+}
+
+/// Plant `pixels` (row-major 15-bit values) into VRAM at (x,y) via an `A0` CPU→VRAM upload — used by
+/// the texture self-tests to lay down a texture or a CLUT before drawing a textured primitive.
+fn upload(g: &mut gpu::Gpu, x: u32, y: u32, w: u32, h: u32, pixels: &[u16]) {
+    g.gp0(0xA000_0000);
+    g.gp0((y << 16) | x);
+    g.gp0((h << 16) | w);
+    let mut i = 0;
+    while i < pixels.len() {
+        let lo = pixels[i] as u32;
+        let hi = *pixels.get(i + 1).unwrap_or(&0) as u32; // odd tail: high half ignored by the GPU
+        g.gp0((hi << 16) | lo);
+        i += 2;
+    }
+}
+
 fn run_selftest() -> bool {
     println!("[CPU self-test]\n");
     let mut pass = true;
@@ -1170,6 +1195,260 @@ fn run_selftest() -> bool {
         bus.write32(0x1F80_10F4, (1 << 23) | (1 << 22) | (1 << 30)); // write 1 to clear ch6 flag; keep enables
         check(&mut pass, "DICR ch6 flag cleared", (bus.read32(0x1F80_10F4) >> 30) & 1, 0);
         check(&mut pass, "DICR master flag cleared", (bus.read32(0x1F80_10F4) >> 31) & 1, 0);
+    }
+
+    // ===== M4d-1: untextured rasterizer (polygons, rectangles, lines) =================
+    // Each test draws a primitive, then reads pixels back through a C0 download (`px`) to confirm what
+    // the rasterizer wrote. Command colour 0x0000FF (red) truncates to the 15-bit VRAM pixel 0x001F.
+    // GP0(E4) sets the drawing-area bottom-right; `FULL_AREA` opens it to the whole framebuffer so the
+    // scissor doesn't reject our test pixels (after a GP1 reset the area is just the single pixel 0,0).
+    const FULL_AREA: u32 = 0xE400_0000 | (511 << 10) | 1023;
+
+    // --- flat triangle: interior filled, exterior untouched ---------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        g.gp0(0x2000_00FF); // flat triangle, colour 0x0000FF
+        g.gp0(0x0000_0000); // v0 (0, 0)
+        g.gp0(0x0000_000A); // v1 (10, 0)
+        g.gp0(0x000A_0000); // v2 (0, 10)
+        check(&mut pass, "flat triangle interior", px(g, 2, 2), 0x001F);
+        check(&mut pass, "flat triangle exterior", px(g, 8, 8), 0x0000);
+    }
+
+    // --- scissor: only pixels inside the GP0(E3/E4) box are drawn ----------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(0xE300_0000 | (2 << 10) | 2); // draw area top-left = (2, 2)
+        g.gp0(0xE400_0000 | (5 << 10) | 5); // draw area bottom-right = (5, 5)
+        g.gp0(0x2000_00FF); // a triangle larger than the box
+        g.gp0(0x0000_0000); // v0 (0, 0)
+        g.gp0(0x0000_000A); // v1 (10, 0)
+        g.gp0(0x000A_0000); // v2 (0, 10)
+        check(&mut pass, "scissor keeps inside-box pixel", px(g, 3, 3), 0x001F);
+        check(&mut pass, "scissor drops outside-box pixel", px(g, 0, 0), 0x0000);
+    }
+
+    // --- flat rectangles: variable-size and fixed 1x1 ---------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        g.gp0(0x6000_00FF); // variable-size rect, colour 0x0000FF
+        g.gp0(0x0000_0000); // position (0, 0)
+        g.gp0((4 << 16) | 4); // size 4 wide x 4 tall
+        check(&mut pass, "rect 4x4 filled corner", px(g, 3, 3), 0x001F);
+        check(&mut pass, "rect 4x4 just outside", px(g, 4, 4), 0x0000);
+        g.gp0(0x6800_00FF); // fixed 1x1 rect
+        g.gp0((10 << 16) | 10); // position (10, 10)
+        check(&mut pass, "rect 1x1 fixed size", px(g, 10, 10), 0x001F);
+    }
+
+    // --- flat lines: horizontal and vertical ------------------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        g.gp0(0x4000_00FF); // flat line ...
+        g.gp0(0x0000_0000); // (0, 0) ...
+        g.gp0(0x0000_000A); // to (10, 0) -> horizontal
+        check(&mut pass, "h-line midpoint", px(g, 5, 0), 0x001F);
+        check(&mut pass, "h-line off-axis empty", px(g, 5, 1), 0x0000);
+        g.gp0(0x4000_00FF);
+        g.gp0(0x0000_0000); // (0, 0) ...
+        g.gp0(0x000A_0000); // to (0, 10) -> vertical
+        check(&mut pass, "v-line midpoint", px(g, 0, 5), 0x001F);
+    }
+
+    // --- drawing offset (GP0 E5) shifts every primitive -------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        g.gp0(0xE500_0000 | (5 << 11) | 5); // offset (+5, +5)
+        g.gp0(0x6800_00FF); // 1x1 rect at (0,0) ...
+        g.gp0(0x0000_0000);
+        check(&mut pass, "offset moves rect to (5,5)", px(g, 5, 5), 0x001F);
+        check(&mut pass, "offset leaves origin empty", px(g, 0, 0), 0x0000);
+    }
+
+    // --- mask bit: check (write-protect) then force-set -------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        g.gp0(0xA000_0000); // upload a mask-bit-set pixel at (0,0) ...
+        g.gp0(0x0000_0000); // dst (0, 0)
+        g.gp0((1 << 16) | 1); // size 1x1
+        g.gp0(0x0000_8000); // pixel = mask bit (15) set, colour 0
+        g.gp0(0xE600_0002); // GP0(E6): check-mask on
+        g.gp0(0x6800_00FF); // try to draw a 1x1 rect over the protected pixel
+        g.gp0(0x0000_0000);
+        check(&mut pass, "mask-check protects pixel", px(g, 0, 0), 0x8000);
+    }
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        g.gp0(0xE600_0001); // GP0(E6): force-set-mask on
+        g.gp0(0x6800_00FF); // draw a 1x1 (colour 0x001F)
+        g.gp0(0x0000_0000);
+        check(&mut pass, "force-set-mask sets bit 15", px(g, 0, 0), 0x801F);
+    }
+
+    // --- Gouraud triangle with a uniform colour interpolates to that colour -----------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        g.gp0(0x3000_00FF); // Gouraud triangle, vertex-0 colour 0x0000FF
+        g.gp0(0x0000_0000); // v0 (0, 0)
+        g.gp0(0x0000_00FF); // colour 1
+        g.gp0(0x0000_000A); // v1 (10, 0)
+        g.gp0(0x0000_00FF); // colour 2
+        g.gp0(0x000A_0000); // v2 (0, 10)
+        check(&mut pass, "gouraud uniform-colour interior", px(g, 2, 2), 0x001F);
+    }
+
+    // ===== M4d-2: texture mapping =====================================================
+    // Each test uploads a tiny texture (and CLUT) via A0, sets the texpage/CLUT/window via E1/E2 and
+    // the command, draws a textured primitive at (100,100), then reads the result back with `px`.
+    // Command colour 0x808080 is the neutral (identity) modulation value.
+
+    // --- 4bpp via CLUT: nibble select + palette lookup --------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        upload(g, 0, 0, 1, 1, &[0x3210]); // 4bpp texels: nibbles give indices 0,1,2,3 for U=0..3
+        upload(g, 0, 2, 2, 1, &[0x7FFF, 0x001F]); // CLUT at (0,2): entry0=white, entry1=red
+        g.gp0(0xE100_0000); // E1: texpage 0 (texX/texY 0), depth 0 = 4bpp
+        g.gp0(0x6C80_8080); // 1x1 textured rect, neutral colour
+        g.gp0(0x0064_0064); // at (100,100)
+        g.gp0(0x0080_0001); // U=1,V=0; CLUT id 0x80 -> (0,2). U=1 -> index 1 -> red
+        check(&mut pass, "4bpp texture via CLUT", px(g, 100, 100), 0x001F);
+    }
+
+    // --- 8bpp via CLUT: byte select ---------------------------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        upload(g, 0, 0, 1, 1, &[0x0201]); // 8bpp: byte0=index1, byte1=index2
+        upload(g, 0, 2, 3, 1, &[0x7FFF, 0x7FFF, 0x03E0]); // CLUT entry2 = green
+        g.gp0(0xE100_0080); // E1: depth 1 = 8bpp (bit7)
+        g.gp0(0x6C80_8080);
+        g.gp0(0x0064_0064);
+        g.gp0(0x0080_0001); // U=1 -> high byte -> index 2 -> green
+        check(&mut pass, "8bpp texture via CLUT", px(g, 100, 100), 0x03E0);
+    }
+
+    // --- 15bpp direct colour ----------------------------------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        upload(g, 0, 0, 1, 1, &[0x7FFF]);
+        g.gp0(0xE100_0100); // E1: depth 2 = 15bpp
+        g.gp0(0x6C80_8080);
+        g.gp0(0x0064_0064);
+        g.gp0(0x0000_0000); // U=0,V=0,CLUT unused
+        check(&mut pass, "15bpp direct texture", px(g, 100, 100), 0x7FFF);
+    }
+
+    // --- black-texel transparency (0x0000 transparent, 0x8000 opaque) -----------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        upload(g, 0, 0, 2, 1, &[0x0000, 0x8000]); // texel0 = transparent black, texel1 = mask-black
+        upload(g, 100, 100, 2, 1, &[0x1234, 0x1234]); // pre-fill both destinations
+        g.gp0(0xE100_0100); // 15bpp
+        g.gp0(0x6C80_8080);
+        g.gp0(0x0064_0064); // (100,100), U=0 -> 0x0000 -> skip
+        g.gp0(0x0000_0000);
+        g.gp0(0x6C80_8080);
+        g.gp0(0x0064_0065); // (101,100), U=1 -> 0x8000 -> opaque
+        g.gp0(0x0000_0001);
+        check(&mut pass, "black texel is transparent", px(g, 100, 100), 0x1234);
+        check(&mut pass, "mask-black texel is opaque", px(g, 101, 100), 0x8000);
+    }
+
+    // --- colour modulation: out5 = (tex5 * col8) >> 7 ---------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        upload(g, 0, 0, 1, 1, &[0x0010]); // texel R = 16 (5-bit), G=B=0
+        g.gp0(0xE100_0100); // 15bpp
+        g.gp0(0x6C00_0040); // command colour R = 64 -> R modulates to (16*64)>>7 = 8
+        g.gp0(0x0064_0064);
+        g.gp0(0x0000_0000);
+        check(&mut pass, "texture colour modulation", px(g, 100, 100), 0x0008);
+    }
+
+    // --- textured sprite X-flip (E1 bit 12) reverses U ---------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        upload(g, 0, 0, 2, 1, &[0x0001, 0x0002]); // texel(0)=1, texel(1)=2
+        g.gp0(0xE100_1100); // 15bpp + X-flip (bit12)
+        g.gp0(0x6480_8080); // variable-size textured rect
+        g.gp0(0x0064_0064); // (100,100)
+        g.gp0(0x0000_0000); // base U=0, V=0
+        g.gp0(0x0001_0002); // size 2x1
+        // X-flip reverses U (with the +1 hardware offset): screen dx=0 -> U=1 -> texel 2;
+        // dx=1 -> U=0 -> texel 1.
+        check(&mut pass, "sprite X-flip left", px(g, 100, 100), 0x0002);
+        check(&mut pass, "sprite X-flip right", px(g, 101, 100), 0x0001);
+    }
+
+    // --- texture window wraps U within a sub-tile -------------------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        upload(g, 0, 0, 9, 1, &[0x1234, 0, 0, 0, 0, 0, 0, 0, 0x5678]); // texel(0) and texel(8)
+        g.gp0(0xE100_0100); // 15bpp
+        g.gp0(0xE200_0001); // E2: mask X = 1 (8-pixel step) -> clears bit 3 of U
+        g.gp0(0x6C80_8080);
+        g.gp0(0x0064_0064);
+        g.gp0(0x0000_0008); // U=8 -> windowed to 0 -> texel(0), NOT texel(8)
+        check(&mut pass, "texture window wraps U", px(g, 100, 100), 0x1234);
+    }
+
+    // --- textured polygon latches its texpage into GPUSTAT ----------------------------
+    {
+        let mut bus = Bus::new();
+        let g = &mut bus.gpu;
+        g.gp1(0x0000_0000);
+        g.gp0(FULL_AREA);
+        g.gp0(0x2480_8080); // flat textured triangle
+        g.gp0(0x0000_0000); // v0 (0,0), uv0+CLUT next
+        g.gp0(0x0000_0000); // uv0=0, CLUT=0
+        g.gp0(0x0000_0004); // v1 (4,0)
+        g.gp0(0x0014_0000); // uv1=0, TEXPAGE=0x14 (high half)
+        g.gp0(0x0004_0000); // v2 (0,4)
+        g.gp0(0x0000_0000); // uv2=0
+        check(&mut pass, "textured poly latches texpage", g.status() & 0x1FF, 0x14);
     }
 
     println!(

@@ -39,12 +39,17 @@ pub fn encode_rgb(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode a PNG into `(width, height, rgb8)`. Handles the suite's 8-bit truecolour references (and,
-/// defensively, RGBA by dropping alpha). Returns `None` for anything we don't diff against — 16-bit,
-/// grayscale, or indexed/palette PNGs (only `benchmark`'s illustrative screenshot is indexed, and
-/// it isn't a gate).
+/// Decode a PNG into `(width, height, rgb8)`. The suite's VRAM references come in two flavours —
+/// 8-bit truecolour (e.g. `triangle`, `rectangles`) *and* palette/indexed (e.g. `clipping` is 4-bit
+/// indexed, `quad`/`lines` are 8-bit indexed). We ask the `png` crate to **expand** both palette
+/// indices and any sub-8-bit/16-bit samples to a flat 8-bit channel layout first, so a single RGB
+/// (or RGBA, alpha dropped) path covers every reference the M4 pixel-diff gates against. Anything that
+/// still isn't 8-bit RGB(A) after that (true grayscale) returns `None`.
 pub fn decode_rgb(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    // EXPAND: palette -> RGB and sub-8-bit -> 8-bit; STRIP_16: 16-bit -> 8-bit. Together they
+    // normalize the reference to 8 bits/channel so the match below stays simple.
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
 
     let mut buf = vec![0u8; reader.output_buffer_size()];
