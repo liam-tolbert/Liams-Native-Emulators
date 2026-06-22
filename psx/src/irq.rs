@@ -7,7 +7,7 @@
 //! the CPU services it" shape the Game Boy used — just one indirection more, because the
 //! PS1 funnels ~11 sources through one CPU line.
 //!
-//! For the foundation milestones nothing *raises* an interrupt yet (`raise` is unused
+//! Early on nothing *raises* an interrupt yet (`raise` is unused
 //! until the GPU/timers land), so the line stays low — but the plumbing is here so the
 //! CPU's interrupt check is real, not a stub.
 

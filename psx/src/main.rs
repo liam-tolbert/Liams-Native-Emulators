@@ -5,21 +5,20 @@
 //! (bus -> cpu, the CPU owning the bus), then dispatches on an optional 2nd arg into one of
 //! the run modes.
 //!
-//! **With M1 the CPU core is real.** The single-step trace mode now actually runs the
-//! interpreter, and there's a `selftest` mode that drives a handful of hand-assembled MIPS
-//! programs through the CPU and checks the results — a built-in, ROM-free correctness gate for
-//! the trickiest parts of the chip (the load- and branch-delay slots, overflow trapping, the
-//! unaligned LWL/LWR pair). The remaining modes still point at the milestone that fills them:
-//!   * `<N>`      single-step register trace            -> M1 (this milestone)
-//!   * `selftest` run the built-in CPU self-test        -> M1 (this milestone)
-//!   * `window`   open a window and run (BIOS-logo demo)-> M4e (display timing + window)
-//!   * `dump [N]` headless: run N frames -> VRAM PNG    -> M4 (GPU)
-//!   * `<exe>`    sideload a PS-EXE and run to a verdict -> M3 (boot + TTY harness)
-//!   * (none)     boot the BIOS headless, echoing TTY    -> M3
+//! The single-step trace mode runs the interpreter, and there's a `selftest` mode that drives a
+//! handful of hand-assembled MIPS programs through the CPU and checks the results — a built-in,
+//! ROM-free correctness gate for the trickiest parts of the chip (the load- and branch-delay
+//! slots, overflow trapping, the unaligned LWL/LWR pair). The run modes are:
+//!   * `<N>`      single-step register trace
+//!   * `selftest` run the built-in CPU self-test
+//!   * `window`   open a window and run (BIOS-logo demo)
+//!   * `dump [N]` headless: run N frames -> VRAM PNG
+//!   * `<exe>`    sideload a PS-EXE and run to a verdict
+//!   * (none)     boot the BIOS headless, echoing TTY
 //!
 //! Mode dispatch deliberately mirrors the Game Boy host shell so the two read the same.
 
-// Scaffold: some device modules are still only partly wired until M3-M4 fill them in (the TTY
+// Scaffold: some device modules are still only partly wired (the TTY
 // hook, the IRQ sources, most of the GPU/DMA), so a few items are "written but not yet called".
 // Mirrors how the DMG crate carried this allow during build-out and dropped it once everything
 // was reachable.
@@ -54,12 +53,12 @@ fn main() {
     if args.len() < 2 {
         let me = &args[0];
         eprintln!("Usage:");
-        eprintln!("  {me} <bios.bin>             boot the BIOS headless, echo TTY      [M3]");
-        eprintln!("  {me} <bios.bin> window      open a window, run (BIOS-logo demo)   [M4e]");
-        eprintln!("  {me} <bios.bin> <N>         single-step N instructions w/ trace   [M1]");
-        eprintln!("  {me} selftest              run the built-in CPU self-test        [M1]");
-        eprintln!("  {me} <bios.bin> <game.exe>  sideload a PS-EXE, run to a verdict    [M3]");
-        eprintln!("  {me} <bios.bin> dump [N]    headless: run N frames -> VRAM PNG     [M4]");
+        eprintln!("  {me} <bios.bin>             boot the BIOS headless, echo TTY");
+        eprintln!("  {me} <bios.bin> window      open a window, run (BIOS-logo demo)");
+        eprintln!("  {me} <bios.bin> <N>         single-step N instructions w/ trace");
+        eprintln!("  {me} selftest              run the built-in CPU self-test");
+        eprintln!("  {me} <bios.bin> <game.exe>  sideload a PS-EXE, run to a verdict");
+        eprintln!("  {me} <bios.bin> dump [N]    headless: run N frames -> VRAM PNG");
         std::process::exit(1);
     }
 
@@ -178,7 +177,7 @@ fn dump_regs(cpu: &Cpu) {
     );
 }
 
-// ===== BIOS boot / PS-EXE sideload harness (M3) =========================================
+// ===== BIOS boot / PS-EXE sideload harness =========================================
 //
 // A real PS1 boots like this: the CPU starts executing the BIOS ROM at 0xBFC00000; the BIOS sets
 // up the kernel (exception handlers, the A0/B0/C0 function tables, a stack, the controllers...),
@@ -239,12 +238,11 @@ fn run_bios_boot(cpu: &mut Cpu) {
     }
 }
 
-// ===== GPU frame dump / VRAM verify harness (M4) ========================================
+// ===== GPU frame dump / VRAM verify harness ========================================
 //
 // The graphics analog of the serial/Blargg golden-file trick: snapshot VRAM and either eyeball it
 // (ASCII thumbnail), save it (PNG, via the from-scratch codec in `img.rs`), or diff it pixel-for-
-// pixel against a reference PNG. M4a stands this up and calibrates it; from M4b on it gates the
-// rasterizer against the `ps1-tests` reference images.
+// pixel against a reference PNG. It gates the rasterizer against the `ps1-tests` reference images.
 
 /// VRAM is a fixed 1024x512 grid of 16-bit pixels (matches `gpu.rs`).
 pub(crate) const VRAM_W: usize = 1024;
@@ -275,6 +273,19 @@ fn run_dump(cpu: &mut Cpu, frames: u32) {
         Ok(_) => println!("\n[dump] wrote {path}  ({VRAM_W}x{VRAM_H} VRAM, {} bytes)", png.len()),
         Err(e) => eprintln!("\n[dump] failed to write {path}: {e}"),
     }
+
+    // Also write just the visible frame — what's actually on screen, cropped out of the larger VRAM
+    // (which holds the off-screen work buffers too). This is the clean screenshot.
+    let (w, h, frame) = cpu.bus.gpu.display_frame();
+    let mut screen_rgb = Vec::with_capacity(w * h * 3);
+    for px in &frame {
+        screen_rgb.extend_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, *px as u8]);
+    }
+    let screen = img::encode_rgb(w as u32, h as u32, &screen_rgb);
+    match std::fs::write("screen.png", &screen) {
+        Ok(_) => println!("[dump] wrote screen.png  ({w}x{h} visible frame, {} bytes)", screen.len()),
+        Err(e) => eprintln!("[dump] failed to write screen.png: {e}"),
+    }
 }
 
 /// Step the CPU until `n` whole frames have elapsed — each frame ends when the GPU trips VBlank
@@ -292,10 +303,10 @@ fn run_frames(cpu: &mut Cpu, n: u32) {
     }
 }
 
-/// `window` run-mode (M4e): open a real window and run the machine at ~60 Hz, blitting the GPU's
+/// `window` run-mode: open a real window and run the machine at ~60 Hz, blitting the GPU's
 /// visible framebuffer each frame. The demo is the BIOS booting to its **Sony Computer Entertainment
 /// logo** on screen — GPU-drawn, animated by the VBlank loop, no game or CD-ROM needed. Mirrors the
-/// Game Boy host shell's window loop. No controller input yet (the PS1 pads are M5+); Esc / closing
+/// Game Boy host shell's window loop. No controller input yet (the PS1 pads come later); Esc / closing
 /// the window quits.
 fn run_window(cpu: &mut Cpu) {
     use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
@@ -369,7 +380,7 @@ pub(crate) fn vram_to_rgb(vram: &[u16]) -> Vec<u8> {
     out
 }
 
-/// Expand a 5-bit channel to 8 bits. **Calibrated against the `ps1-tests` references (M4b):** the
+/// Expand a 5-bit channel to 8 bits. **Calibrated against the `ps1-tests` references:** the
 /// suite top-aligns (`v << 3`), so 0x1F maps to 0xF8 and no channel ever reaches 0xFF — confirmed
 /// empirically (a reference scan finds no 255). This must match the suite's generator exactly or the
 /// pixel-diff is off by the low bits everywhere; bit-replication (`(v<<3)|(v>>2)`) was the wrong guess.
@@ -401,7 +412,7 @@ fn print_vram_ascii(rgb: &[u8]) {
 
 /// Diff a VRAM snapshot against a reference PNG, pixel-exact. Returns true on a perfect match; on a
 /// mismatch it prints how far off we are, including a hint that distinguishes a real rendering bug
-/// from a mere colour-expansion miscalibration (the M4b "is `expand5` right?" question — if *every*
+/// from a mere colour-expansion miscalibration (the "is `expand5` right?" question — if *every*
 /// channel is off by <= 7, it's the 5->8 expansion, not the pixels).
 fn diff_vram_vs_png(vram: &[u16], ref_path: &str) -> bool {
     let bytes = match std::fs::read(ref_path) {
@@ -561,8 +572,8 @@ fn run_sideload(cpu: &mut Cpu, exe_path: &str) {
             println!("\n[verdict] VRAM MATCHES {} (pixel-exact)", vram_ref.display());
         } else {
             println!("\n[verdict] VRAM DIFFERS from {}", vram_ref.display());
-            // Dump what we actually produced so the failure is inspectable (and useful for the M4d
-            // rasterizer stage that makes these render tests pass for real).
+            // Dump what we actually produced so the failure is inspectable (and useful for the
+            // rasterizer that makes these render tests pass for real).
             let rgb = vram_to_rgb(cpu.bus.gpu.vram());
             print_vram_ascii(&rgb);
             let _ = std::fs::write("vram_dump.png", img::encode_rgb(VRAM_W as u32, VRAM_H as u32, &rgb));

@@ -2,20 +2,20 @@
 //!
 //! ## Why this exists
 //!
-//! M4's correctness discipline is the same golden-file diffing the rest of the project lives by
+//! The correctness discipline here is the same golden-file diffing the rest of the project lives by
 //! (Blargg's serial output, the dmg-acid2 thumbnail): render into VRAM, then compare pixel-for-pixel
 //! against a reference image. The reference images that ship with the JaCzekanski `ps1-tests` suite
 //! are **PNGs** — and, crucially, *real DEFLATE-compressed* ones (a 1024x512 frame is ~15-25 KB, not
 //! the ~1.5 MB it would be uncompressed). So the harness needs a genuine PNG decoder.
 //!
-//! M4a got away with a hand-rolled *uncompressed* codec because it only ever round-tripped its own
-//! dumps. M4b has to ingest the suite's compressed references, which means a full DEFLATE inflate and
+//! An early hand-rolled *uncompressed* codec got away with it because it only ever round-tripped its
+//! own dumps. Ingesting the suite's compressed references means a full DEFLATE inflate and
 //! all five PNG scanline filters. Rather than hand-roll that, this module is now a thin wrapper over
 //! the **`png` crate** (which pulls in `miniz_oxide`/`flate2` for the actual inflate/deflate). That's
 //! the project's first non-`minifb` dependency, but it lives entirely on the **host/test side** — the
 //! emulated machine never touches it — so the emulator core stays dependency-light and clean-room.
 //!
-//! The two public functions keep the exact signatures the M4a harness already calls, so `main.rs`
+//! The two public functions keep the exact signatures the harness already calls, so `main.rs`
 //! and the self-test are untouched by the switch.
 
 /// Encode an 8-bit RGB image (`rgb` is `width*height*3` bytes, row-major) as a PNG byte vector.
@@ -43,7 +43,7 @@ pub fn encode_rgb(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
 /// 8-bit truecolour (e.g. `triangle`, `rectangles`) *and* palette/indexed (e.g. `clipping` is 4-bit
 /// indexed, `quad`/`lines` are 8-bit indexed). We ask the `png` crate to **expand** both palette
 /// indices and any sub-8-bit/16-bit samples to a flat 8-bit channel layout first, so a single RGB
-/// (or RGBA, alpha dropped) path covers every reference the M4 pixel-diff gates against. Anything that
+/// (or RGBA, alpha dropped) path covers every reference the pixel-diff gates against. Anything that
 /// still isn't 8-bit RGB(A) after that (true grayscale) returns `None`.
 pub fn decode_rgb(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));

@@ -1,4 +1,4 @@
-//! The GPU — **M4a: VRAM + the GP0/GP1 register model + a real GPUSTAT.**
+//! The GPU — VRAM, the GP0/GP1 register model, GPUSTAT, and the software rasterizer.
 //!
 //! ## What the PS1 GPU is (for someone who's never met it)
 //!
@@ -27,23 +27,20 @@
 //!
 //! A single GP0 *command* is several words long — a flat triangle is 4 words (a colour, then three
 //! XY vertices), a Gouraud-shaded textured quad is 11. But the CPU writes the port **one 32-bit word
-//! at a time**, and (as of M4c) the DMA engine dribbles those same words in independently. So
+//! at a time**, and the DMA engine dribbles those same words in independently. So
 //! the GPU can't treat each write as a whole command: it must remember a *partial* command across
 //! writes — read the first word to learn which command and how many words it needs, accumulate that
 //! many, then execute. That accumulate-then-fire logic is the heart of this file (`gp0`).
 //!
-//! ## What M4a does (and deliberately doesn't)
+//! ## How this file is organised
 //!
-//! M4a builds the **skeleton**: the VRAM array, the GP0/GP1 command model, and a GPUSTAT computed
-//! from real internal state (replacing the M0-M3 stub that just forced the "ready" bits on). It
-//! **draws nothing** — every rendering and image-transfer command is *parsed* (so the FIFO stays in
-//! sync) but its executor is a stub. The pixel work lands in later stages:
-//!   * M4b — VRAM transfers & fill (`02`, `A0`, `C0`, `80`).
-//!   * M4c — DMA channels 2 (GPU) + 6 (OTC) that feed GP0/VRAM without the CPU.
-//!   * M4d — the software rasterizer (polygons, rectangles, lines).
-//!   * M4e — display timing (VBlank) and the on-screen window.
-//! The draw-*state* commands (`E1`-`E6`) and the GP1 knobs are fully modelled now, because GPUSTAT is
-//! assembled from them and later stages will read them straight back.
+//! The foundation is the **skeleton**: the VRAM array, the GP0/GP1 command model, and a GPUSTAT
+//! computed from real internal state. On top of that sit the **VRAM transfers & fill** (`02`,
+//! `A0`, `C0`, `80`), the **software rasterizer** (polygons, rectangles, lines), and **display
+//! timing** (VBlank) with the on-screen window. The DMA engine feeds GP0/VRAM without the CPU.
+//! Every rendering and image-transfer command is *parsed* (so the FIFO stays in sync) before its
+//! executor runs. The draw-*state* commands (`E1`-`E6`) and the GP1 knobs feed GPUSTAT, which is
+//! assembled from them, and the rasterizer reads them straight back.
 
 use std::cell::Cell;
 
@@ -74,12 +71,12 @@ pub struct Gpu {
     /// The command byte (top 8 bits of the first word) currently being assembled.
     gp0_command: u8,
     /// Words still to consume as raw pixel data during a CPU->VRAM image upload (`A0`). While this
-    /// is non-zero, GP0 writes are image data, not commands. (M4a drops them; M4b writes VRAM.)
+    /// is non-zero, GP0 writes are image data, not commands, and land in VRAM.
     gp0_img_words: usize,
     /// True while draining a variable-length polyline (`48`-`5F` with the polyline bit) until its
     /// terminator word arrives. Polylines have no fixed length, so they can't use `gp0_remaining`.
     gp0_polyline: bool,
-    /// Polyline render state (M4d-1). A polyline streams an arbitrary number of points; we draw each
+    /// Polyline render state. A polyline streams an arbitrary number of points; we draw each
     /// segment the moment its far endpoint arrives, so we only need the *previous* point/colour rather
     /// than buffering the whole list. `poly_is_gouraud` selects the per-point colour↔vertex interleave;
     /// `poly_expect_color` tracks which half of that pair is next (Gouraud only). Colours are kept as
@@ -94,12 +91,12 @@ pub struct Gpu {
     /// in scope in the drain, so it's latched here when the polyline is seeded.
     poly_semi: Option<u8>,
 
-    // ===== draw state (set by GP0 E1-E6; read back by the rasterizer in M4d) =============
+    // ===== draw state (set by GP0 E1-E6; read back by the rasterizer) =============
     /// GP0(E1) "draw mode": texture-page base, semi-transparency mode, texture colour depth,
     /// dither enable, draw-to-display-area flag, texture-disable, rectangle texture flips. We keep
     /// the low 14 bits verbatim because GPUSTAT bits 0-10 and 15 are taken straight from them.
     draw_mode: u32,
-    /// GP0(E2) texture window (mask/offset, in 8-pixel units). Stored for M4d texture sampling.
+    /// GP0(E2) texture window (mask/offset, in 8-pixel units). Stored for texture sampling.
     tex_window: u32,
     /// GP0(E3/E4) clipping rectangle — the rasterizer must not draw outside it.
     draw_area_left: u16,
@@ -130,7 +127,7 @@ pub struct Gpu {
     display_vram_x: u16,
     display_vram_y: u16,
     /// GP1(06/07): the horizontal/vertical display range, in GPU clocks / scanlines. Stored for the
-    /// M4e window sizing; not load-bearing yet.
+    /// display window sizing; not load-bearing yet.
     display_h1: u16,
     display_h2: u16,
     display_v1: u16,
@@ -139,7 +136,7 @@ pub struct Gpu {
     /// 15/24-bit colour, interlace, the "reverse" flag. Scattered into GPUSTAT bits 14 and 16-22.
     display_mode: u32,
 
-    // ===== display timing (M4e) =========================================================
+    // ===== display timing =========================================================
     // Free-running, the way real hardware keeps time: `tick` (called from `bus.tick` every CPU
     // instruction) accumulates cycles and trips a VBlank once per frame. Deliberately *not* reset by
     // GP1(00) — a GP-port command can't stop the video clock.
@@ -151,13 +148,13 @@ pub struct Gpu {
     /// Interlace field flag, toggled once per frame → GPUSTAT bit 31 (the "drawing odd/even line").
     field_odd: bool,
 
-    /// The staged GPUREAD response (answer to a GP1(10) "GPU info" request; VRAM read-back is M4b).
+    /// The staged GPUREAD response (answer to a GP1(10) "GPU info" request; VRAM read-back too).
     gpuread: u32,
     /// The GPU's own interrupt request (GP0(1F) raises it, GP1(02) acknowledges it). GPUSTAT bit 24;
     /// it feeds IRQ source 1 once that's wired in a later stage.
     irq: bool,
 
-    // ===== in-progress VRAM image transfers (M4b) =======================================
+    // ===== in-progress VRAM image transfers =======================================
     /// CPU->VRAM upload (`A0`) cursor: the destination rectangle and how many of its pixels have been
     /// written so far. While `gp0_img_words` is non-zero, GP0 data words land here.
     up_x: u16,
@@ -166,7 +163,7 @@ pub struct Gpu {
     up_h: u16,
     up_px: u32,
     /// VRAM->CPU download (`C0`) cursor. `dl_px` is a `Cell` because GPUREAD advances the stream from
-    /// `read(&self)` — a read that mutates, the ownership wrinkle flagged in M4a (see `read`).
+    /// `read(&self)` — a read that mutates, the ownership wrinkle flagged here (see `read`).
     dl_x: u16,
     dl_y: u16,
     dl_w: u16,
@@ -236,13 +233,13 @@ impl Gpu {
     pub fn vram(&self) -> &[u16] {
         &self.vram
     }
-    /// Mutable VRAM, used only by the M4a self-test to poke a known pattern for harness calibration.
-    /// The drawing commands that fill VRAM for real arrive in M4b (transfers) and M4d (rasterizer).
+    /// Mutable VRAM, used only by the self-test to poke a known pattern for harness calibration.
+    /// The drawing commands that fill VRAM for real are the transfers and the rasterizer.
     pub fn vram_mut(&mut self) -> &mut [u16] {
         &mut self.vram
     }
 
-    // ===== display timing + readout (M4e) ===============================================
+    // ===== display timing + readout ===============================================
 
     /// Advance the video clock by `cycles` CPU cycles (called from `bus.tick`). Returns `true` once
     /// per frame, on the cycle that crosses a frame boundary — the bus turns that into the VBlank IRQ.
@@ -318,7 +315,7 @@ impl Gpu {
     /// Write one pixel. **Gotcha: VRAM coordinates wrap** — VRAM is a fixed 1024x512 torus, and the
     /// hardware silently masks X to 0..1023 and Y to 0..511 rather than faulting. A primitive whose
     /// offset pushes it off the right edge reappears on the left, so the wrap is behaviour to
-    /// reproduce, not an error to guard against. (Used by M4b onward; here so the rule lives in one spot.)
+    /// reproduce, not an error to guard against. (Here so the rule lives in one spot.)
     fn vram_set(&mut self, x: i32, y: i32, color: u16) {
         let x = (x as usize) & (VRAM_W - 1); // & 1023  (VRAM_W is a power of two)
         let y = (y as usize) & (VRAM_H - 1); // & 511
@@ -332,7 +329,7 @@ impl Gpu {
         self.vram[y * VRAM_W + x]
     }
 
-    // ===== the shared pixel pipeline (M4d) ==============================================
+    // ===== the shared pixel pipeline ==============================================
 
     /// Write one already-shaded pixel for a *drawn* primitive (polygon / line / rectangle). This is
     /// the single choke point every rasterizer routine funnels through, so the three rules that apply
@@ -343,7 +340,7 @@ impl Gpu {
     ///      set, leave it alone (a write-protect the hardware honours per-pixel).
     ///   3. **Mask force** (GP0(E6) bit 0) — OR the mask bit into whatever we do write.
     /// (The `02` FILL deliberately bypasses all three — see `execute_gp0` — which is why it doesn't
-    /// call here.) The seam marked below is where M4d-3 semi-transparency will blend against `dst`.
+    /// call here.) The seam marked below is where semi-transparency blends against `dst`.
     fn plot(&mut self, x: i32, y: i32, color: u16, semi: Option<u8>) {
         if x < self.draw_area_left as i32
             || x > self.draw_area_right as i32
@@ -356,7 +353,7 @@ impl Gpu {
         if self.check_mask && dst & 0x8000 != 0 {
             return;
         }
-        // Semi-transparency (M4d-3): when `semi` is set, blend the incoming colour against the
+        // Semi-transparency: when `semi` is set, blend the incoming colour against the
         // destination (`dst` = "back", `color` = "front") per the active mode, keeping the *source*
         // mask bit (the texel STP, or 0 for untextured). `None` = the opaque path.
         let blended = match semi {
@@ -417,7 +414,7 @@ impl Gpu {
 
     // ===== the four ports the bus routes to =============================================
 
-    /// `GPUSTAT` (`0x1F801814` read) — assembled from the live register state above. Until M4a this
+    /// `GPUSTAT` (`0x1F801814` read) — assembled from the live register state above. Early on this
     /// was a constant `0x1C000000`; the BIOS now drives it through a real reset + poll path.
     pub fn status(&self) -> u32 {
         let mut s = 0u32;
@@ -451,13 +448,13 @@ impl Gpu {
         // Bits 26/27/28 — "ready for a command word / to send VRAM / to receive a DMA block."
         // We execute every command synchronously the instant its last word arrives, so the GPU is
         // *always* ready; forcing these high is what lets a polling BIOS fall straight through (this
-        // is the one behaviour we carry over from the M0-M3 stub's 0x1C000000).
+        // is the one behaviour we carry over from the early stub's 0x1C000000).
         s |= 1 << 26;
         s |= 1 << 27;
         s |= 1 << 28;
 
         // Bit 25 — the DMA / data request line. **Gotcha:** its meaning depends on the GP1(04) DMA
-        // direction, and the DMA controller (M4c) polls it to decide whether the GPU wants a block.
+        // direction, and the DMA controller polls it to decide whether the GPU wants a block.
         // If we left it 0 the GPU-DMA channel would never fire. Mirror the matching ready bit per
         // direction: FIFO -> cmd-ready (26), CPU->GP0 -> dma-block-ready (28), GPUREAD->CPU ->
         // vram-send-ready (27); "off" requests nothing.
@@ -470,7 +467,7 @@ impl Gpu {
         s |= dma_req << 25;
 
         // Bits 29-30 echo the DMA direction back. Bit 31 is the interlace field ("drawing odd/even
-        // line"), flipped once per frame by `tick` (M4e); games poll it to sync to the field.
+        // line"), flipped once per frame by `tick`; games poll it to sync to the field.
         s |= (self.dma_direction as u32) << 29;
         s |= (self.field_odd as u32) << 31;
 
@@ -713,9 +710,9 @@ impl Gpu {
 
     // ===== GP0 dispatch =================================================================
 
-    /// Run a fully-gathered GP0 command. M4a executes the *state* settings (E1-E6) and a couple of
+    /// Run a fully-gathered GP0 command. This executes the *state* settings (E1-E6) and a couple of
     /// trivia commands; every drawing / transfer command is recognised and its parameters consumed
-    /// (so the FIFO stays aligned) but its pixel work is deferred to the stage that owns it.
+    /// (so the FIFO stays aligned) before its pixel work runs.
     fn execute_gp0(&mut self) {
         let cmd = self.gp0_command;
         let w0 = self.gp0_buffer[0];
@@ -744,7 +741,7 @@ impl Gpu {
             }
             0x1F => self.irq = true,    // request a GPU interrupt (GPUSTAT bit 24)
 
-            // --- draw-state settings (fully modelled now; the rasterizer reads these in M4d) -----
+            // --- draw-state settings (fully modelled; the rasterizer reads these) -----
             0xE1 => {
                 // Draw mode: texpage / semi-transp / depth / dither / flips. **Bit 11 (texture-
                 // disable) is special:** it can only be *set* while GP1(09) has allowed it; when not
@@ -774,12 +771,12 @@ impl Gpu {
                 self.check_mask = w0 & 2 != 0;
             }
 
-            // --- rendering primitives (M4d-1: untextured) --------------------------------------
+            // --- rendering primitives --------------------------------------
             0x20..=0x3F => self.draw_polygon(cmd),
             0x40..=0x5F => self.draw_gp0_line(cmd), // non-polyline; polylines render in `gp0`'s drain
             0x60..=0x7F => self.draw_gp0_rect(cmd),
 
-            // --- VRAM transfers (M4b) -----------------------------------------------------------
+            // --- VRAM transfers -----------------------------------------------------------
             0x80..=0x9F => {
                 // VRAM -> VRAM block copy: source, destination, size. **Gotcha: source and
                 // destination may overlap** (the `vram-to-vram-overlap` test exists for exactly this);
@@ -829,7 +826,7 @@ impl Gpu {
         self.gp0_len = 0;
     }
 
-    // ===== rendering primitives (M4d-1) =================================================
+    // ===== rendering primitives =================================================
 
     /// Decode and draw a polygon command (0x20-0x3F). The command byte's bits pick the shape:
     /// bit4 = Gouraud (per-vertex colour), bit3 = quad (4 vertices, drawn as two triangles), bit2 =
@@ -1265,7 +1262,7 @@ fn inside_edge(w: i64, a: (i32, i32), b: (i32, i32)) -> bool {
     dy < 0 || (dy == 0 && dx > 0)
 }
 
-// ===== texture helpers (M4d-2) ==========================================================
+// ===== texture helpers ==========================================================
 
 /// Everything `sample_texel` needs to read one texel: where the texture page sits in VRAM, where the
 /// CLUT (palette) sits, and the colour depth. Built once per textured primitive from the command's

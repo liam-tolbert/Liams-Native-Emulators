@@ -1,4 +1,4 @@
-//! The hardware timer — DIV / TIMA / TMA / TAC.   *Implemented in milestone M3 (Liam).*
+//! The hardware timer — DIV / TIMA / TMA / TAC.
 //!
 //! Register map (all in the 0xFF0_ I/O page):
 //!   * 0xFF04 DIV  — increments at 16384 Hz; *any* write resets it to 0.
@@ -6,7 +6,7 @@
 //!   * 0xFF06 TMA  — TIMA is reloaded from here when it overflows.
 //!   * 0xFF07 TAC  — bit 2 enables the timer; bits 0-1 pick the rate.
 //!
-//! The accurate model (M3) keeps an internal 16-bit counter: DIV is its high byte,
+//! The accurate model keeps an internal 16-bit counter: DIV is its high byte,
 //! and TIMA ticks on the *falling edge* of a TAC-selected bit of that counter. That
 //! falling-edge detail (and "writing DIV resets the counter, which can itself tick
 //! TIMA") is what Blargg's `instr_timing` / the Mooneye timer tests check.

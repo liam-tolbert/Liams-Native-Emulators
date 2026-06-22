@@ -1,4 +1,4 @@
-//! The joypad — the P1/JOYP register at 0xFF00.   *Implemented in milestone M6 (Liam).*
+//! The joypad — the P1/JOYP register at 0xFF00.
 //!
 //! Eight buttons share one register through a 2x4 matrix. The CPU writes bit 4 or
 //! bit 5 to select either the direction pad or the action buttons, then reads the

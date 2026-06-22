@@ -4,7 +4,7 @@
 //! (bit 0 = highest). A source *requests* an interrupt by setting its bit in IF
 //! (0xFF0F); the program *enables* a source by setting its bit in IE (0xFFFF). The
 //! CPU services an interrupt only when `IME && (IF & IE & 0x1F) != 0` — that check
-//! and the push-PC/jump-to-vector sequence live in the CPU (M1).
+//! and the push-PC/jump-to-vector sequence live in the CPU.
 
 pub const VBLANK: u8 = 1 << 0; // PPU entered VBlank          -> vector 0x40
 pub const LCD_STAT: u8 = 1 << 1; // configurable PPU/STAT event -> vector 0x48
@@ -50,7 +50,7 @@ impl Interrupts {
         self.enable = v;
     }
 
-    /// Bits that are both pending and enabled (what the CPU acts on). M1 uses this.
+    /// Bits that are both pending and enabled (what the CPU acts on). The CPU uses this.
     pub fn pending(&self) -> u8 {
         self.flag & self.enable & 0x1F
     }

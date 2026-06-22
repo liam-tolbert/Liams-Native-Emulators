@@ -81,7 +81,7 @@ impl Bus {
         self.ppu.step(t_cycles, &mut self.ints);
     }
 
-    /// Host hook (M6): push the latest button bitmask (joypad::BTN_* layout) in from
+    /// Host hook: push the latest button bitmask (joypad::BTN_* layout) in from
     /// the host shell. We hand the joypad `&mut self.ints` so a fresh press can raise
     /// the JOYPAD interrupt — the same "give the subsystem the interrupt line" shape as
     /// `tick`. This is plumbing; the interesting logic lives in `Joypad::set_buttons`.

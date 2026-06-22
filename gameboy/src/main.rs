@@ -37,8 +37,8 @@ fn main() {
     });
 
     // Optional 2nd arg selects what to do after loading the ROM:
-    //   (none)  -> just print the header  (the M0 check)
-    //   <N>     -> single-step N instructions with a register trace  (M1 debugging)
+    //   (none)  -> just print the header
+    //   <N>     -> single-step N instructions with a register trace
     //   run     -> free-run until the ROM prints a serial verdict  (Blargg cpu_instrs)
     let mode = args.get(2).map(String::as_str);
 
@@ -46,7 +46,7 @@ fn main() {
     let cart = Cartridge::new(rom);
     let bus = Bus::new(cart);
 
-    // --- M0: dump what we parsed out of the 0x0100-0x014F header ---
+    // --- dump what we parsed out of the 0x0100-0x014F header ---
     // (Scoped so the borrow ends before the bus moves into the CPU below.)
     {
         let h = bus.header();
@@ -58,7 +58,7 @@ fn main() {
     }
 
     match mode {
-        // --- M1 single-step harness: `cargo run -- <rom> <N>` traces N instructions ---
+        // --- single-step harness: `cargo run -- <rom> <N>` traces N instructions ---
         // Each line shows the next opcode and the register file *before* it executes; the
         // CPU panics on the first illegal opcode (telling you which + the PC).
         Some(n) if n.bytes().all(|b| b.is_ascii_digit()) => {
@@ -195,7 +195,7 @@ fn main() {
                     .update_with_buffer(&buffer, ppu::SCREEN_W, ppu::SCREEN_H)
                     .expect("failed to update window");
 
-                // --- (M6) sample the keyboard into the joypad, once per frame ---
+                // --- sample the keyboard into the joypad, once per frame ---
                 // Build a BTN_* bitmask (1 = pressed) from whichever host keys are down,
                 // then hand it to the bus, which forwards it to the joypad. All the
                 // hardware quirks (active-low, the 2x4 matrix, the press interrupt) live

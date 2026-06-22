@@ -1,9 +1,9 @@
-//! The Picture Processing Unit — a scanline renderer.   *Implemented in M4 / M5.*
+//! The Picture Processing Unit — a scanline renderer.
 //!
 //! The PPU walks 154 scanlines of 456 dots each (≈70,224 dots = one 59.7 Hz frame).
 //! Per visible line it cycles through modes: OAM scan (2) -> drawing (3) -> HBlank
-//! (0); lines 144-153 are VBlank (1). It renders the background + window (M4) and
-//! sprites from OAM (M5), and raises the VBlank and STAT interrupts.
+//! (0); lines 144-153 are VBlank (1). It renders the background + window and
+//! sprites from OAM, and raises the VBlank and STAT interrupts.
 //!
 //! Output is `framebuffer`, one palette index (0..=3) per pixel — the host maps those
 //! four shades to RGB, exactly as `chip8/src/main.rs` mapped its 1-bit display.
@@ -416,7 +416,7 @@ impl Ppu {
             0xFF49 => self.obp1 = val,
             0xFF4A => self.wy = val,
             0xFF4B => self.wx = val,
-            // 0xFF46 OAM DMA is handled by the bus in M5 (it copies 0xXX00-0xXX9F -> OAM).
+            // 0xFF46 OAM DMA is handled by the bus (it copies 0xXX00-0xXX9F -> OAM).
             _ => {}
         }
     }

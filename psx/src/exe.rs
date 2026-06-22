@@ -1,4 +1,4 @@
-//! PS-EXE loader (used by the M3 test harness).
+//! PS-EXE loader (used by the test harness).
 //!
 //! A `.exe` (more precisely a "PS-X EXE") is the raw executable the BIOS would normally
 //! copy off the CD and run. Homebrew and the amidog CPU/GTE test programs ship in this

@@ -1,9 +1,9 @@
 //! Built-in, ROM-free correctness gate — extracted from `main.rs` to keep the host shell lean.
 //!
 //! `run_selftest` hand-assembles tiny MIPS programs (the encoders live at the bottom) and small GP0
-//! command sequences, runs them on a fresh `Bus`, and checks architecturally-correct results: the CPU
-//! milestones (M1/M2), the GPU register + transfer model (M4a/M4b), DMA (M4c), and the rasterizer
-//! (M4d-1/2/3). It is this crate's stand-in for a `cargo test` suite; `main` runs it for the
+//! command sequences, runs them on a fresh `Bus`, and checks architecturally-correct results: the CPU,
+//! the GPU register + transfer model, DMA, and the rasterizer. It is this crate's stand-in for a
+//! `cargo test` suite; `main` runs it for the
 //! `selftest` mode. Shared host-side helpers (`VRAM_W`/`VRAM_H`, `vram_to_rgb`, the PNG codec in
 //! `img`) are imported from the crate root.
 
@@ -205,9 +205,9 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "settled into r5", cpu.regs[5], 0x6655_4433);
     }
 
-    // ===== M2: memory map, MMIO, exceptions & interrupt delivery =======================
-    // M1 pulled most of this machinery forward so the CPU could boot the BIOS; M2 is where it
-    // gets *exercised and gated*. The headline gap M1 left is interrupt delivery — `Irq::raise`
+    // ===== memory map, MMIO, exceptions & interrupt delivery =======================
+    // Most of this machinery was pulled forward so the CPU could boot the BIOS; here is where it
+    // gets *exercised and gated*. The headline gap left earlier is interrupt delivery — `Irq::raise`
     // had no caller, so the whole source -> I_STAT -> mask -> Cause.IP2 -> service -> RFE chain
     // had never run. These scenarios drive it (device-free, via software interrupts and a
     // synthetic `raise`), alongside the memory map / MMIO routing and the address-error path.
@@ -245,7 +245,7 @@ pub(crate) fn run_selftest() -> bool {
             sw(6, 5, 0),       // mem_control[0] = 0xCAFE
             lw(7, 5, 0),       // r7 <- mem_control[0] (delayed)
             lui(8, 0xBF80),    // (commits the r7 load)
-            ori(8, 8, 0x1100), // r8 = 0xBF80_1100  (timer 0 — stubbed until M4)
+            ori(8, 8, 0x1100), // r8 = 0xBF80_1100  (timer 0 — stubbed)
             lw(9, 8, 0),       // r9 <- timer       (delayed)
             NOP,               // settle the last load
         ];
@@ -339,7 +339,7 @@ pub(crate) fn run_selftest() -> bool {
     // A "device" raises a source in I_STAT; I_MASK lets it through; the controller pulls the
     // CPU's single external line (COP0 Cause.IP2); with IEc + IM bit 10 set, the CPU takes it.
     // Then the handler acknowledges I_STAT and the aggregated line drops. This is the end-to-end
-    // path `Irq::raise` exists for (the real sources arrive with the timers/GPU in M4).
+    // path `Irq::raise` exists for (the real sources arrive with the timers/GPU).
     {
         let prog = [
             lui(1, 0xBF80),
@@ -407,7 +407,7 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "normal store wrote (r7)", cpu.regs[7], 0x0000_BBBB);
     }
 
-    // ===== M4a: GPU register model + the PNG verify harness ============================
+    // ===== GPU register model + the PNG verify harness ============================
     // The GPU draws nothing yet, so these don't use the `gpu/` reference images — they pin the
     // register model (GP0 state commands + GP1 knobs surfaced through GPUSTAT, and the GP0 FIFO
     // consuming the right word counts) and calibrate the VRAM -> RGB -> PNG -> RGB round-trip the
@@ -475,7 +475,7 @@ pub(crate) fn run_selftest() -> bool {
         g.gp0(0xA000_0000); // CPU->VRAM
         g.gp0(0x0000_0000); // destination (0, 0)
         g.gp0(0x0002_0002); // size 2 x 2 -> 4 pixels -> 2 data words
-        g.gp0(0xDEAD_BEEF); // pixel data word 1 (dropped in M4a)
+        g.gp0(0xDEAD_BEEF); // pixel data word 1
         g.gp0(0xCAFE_BABE); // pixel data word 2
         g.gp0(0xE300_0000 | (20 << 10) | 10); // draw area top-left = (10, 20)
         g.gp1(0x1000_0003); // GPU-info request 3 -> draw-area TL
@@ -512,7 +512,7 @@ pub(crate) fn run_selftest() -> bool {
         }
     }
 
-    // ===== M4b: VRAM transfers (A0 / C0 / 02 fill) =====================================
+    // ===== VRAM transfers (A0 / C0 / 02 fill) =====================================
     // --- A0 CPU->VRAM upload, then C0 VRAM->CPU download, round-trips the same pixels ---
     {
         let mut bus = Bus::new();
@@ -561,7 +561,7 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "80 VRAM->VRAM copy round-trip", g.read(), 0x1357_ABCD);
     }
 
-    // ===== M4c: DMA (channels 2 GPU + 6 OTC, and the DMA interrupt) ====================
+    // ===== DMA (channels 2 GPU + 6 OTC, and the DMA interrupt) ====================
     // These drive the DMA through the real bus path: program MADR/BCR (and DPCR/DICR) via MMIO
     // writes, then write CHCR last — the start bit in that write is what kicks the transfer. DMA
     // runs synchronously, so the result is observable immediately afterward. (DMA addresses are
@@ -645,7 +645,7 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "DICR master flag cleared", (bus.read32(0x1F80_10F4) >> 31) & 1, 0);
     }
 
-    // ===== M4d-1: untextured rasterizer (polygons, rectangles, lines) =================
+    // ===== untextured rasterizer (polygons, rectangles, lines) =================
     // Each test draws a primitive, then reads pixels back through a C0 download (`px`) to confirm what
     // the rasterizer wrote. Command colour 0x0000FF (red) truncates to the 15-bit VRAM pixel 0x001F.
     // GP0(E4) sets the drawing-area bottom-right; `FULL_AREA` opens it to the whole framebuffer so the
@@ -768,7 +768,7 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "gouraud uniform-colour interior", px(g, 2, 2), 0x001F);
     }
 
-    // ===== M4d-2: texture mapping =====================================================
+    // ===== texture mapping =====================================================
     // Each test uploads a tiny texture (and CLUT) via A0, sets the texpage/CLUT/window via E1/E2 and
     // the command, draws a textured primitive at (100,100), then reads the result back with `px`.
     // Command colour 0x808080 is the neutral (identity) modulation value.
@@ -899,7 +899,7 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "textured poly latches texpage", g.status() & 0x1FF, 0x14);
     }
 
-    // ===== M4d-3: semi-transparency ===================================================
+    // ===== semi-transparency ===================================================
     // Blend an incoming pixel over a pre-filled "back" pixel B = (10,10,10) = 0x294A. The front
     // F = (20,4,0) comes from an untextured 1x1 rect with command colour 0x0020A0. The blend mode is
     // GP0(E1) bits 5-6; the semi-transparent enable is command-byte bit 1 (so `0x6A` = semi 1x1 rect,
@@ -1011,7 +1011,7 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "check-mask skips blend", px(g, 100, 100), 0xA94A);
     }
 
-    // ===== M4e: display timing (VBlank) ================================================
+    // ===== display timing (VBlank) ================================================
     // Drive the bus's catch-up `tick` directly (no CPU) and watch the GPU trip a frame: VBlank should
     // hit `I_STAT` bit 0 exactly when the cycle accumulator crosses CPU_CYCLES_PER_FRAME, the
     // `frame_ready` flag should latch (and clear on read), and GPUSTAT bit 31 (the interlace field)

@@ -1,8 +1,8 @@
-//! DMA controller — **M4c: channels 2 (GPU) and 6 (OTC), plus the DMA interrupt.**
+//! DMA controller — channels 2 (GPU) and 6 (OTC), plus the DMA interrupt.
 //!
 //! DMA ("direct memory access") is the hardware that moves blocks between RAM and a device
 //! *without* the CPU copying word-by-word. The PS1 has seven channels (MDEC in/out, GPU, CD-ROM,
-//! SPU, PIO, OTC); we implement the two that M4 needs:
+//! SPU, PIO, OTC); we implement the two that the GPU path needs:
 //!
 //!  * **Channel 2 (GPU).** Two shapes. In *block mode* it streams CPU↔VRAM image data through the
 //!    GP0/GPUREAD ports (the `A0`/`C0` transfers). In *linked-list mode* it walks a chain of command

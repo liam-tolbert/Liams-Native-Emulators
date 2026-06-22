@@ -4,7 +4,7 @@
 //! maps its whole ROM straight into 0x0000-0x7FFF. A *minimal MBC1* cart adds
 //! ROM-bank switching for the 0x4000-0x7FFF window — enough for the multi-bank Blargg
 //! test ROMs. Full MBC1 (RAM banking, the mode flag, battery save RAM) and MBC3 are
-//! the optional M7/M8 stretch, slotting in behind the same `read`/`write` interface.
+//! an optional stretch goal, slotting in behind the same `read`/`write` interface.
 //!
 //! ## The cartridge header (0x0100-0x014F)
 //! Every Game Boy ROM carries a fixed header. We only need a few fields:
@@ -29,7 +29,7 @@ pub struct Cartridge {
     // --- Banking state. A NoMBC cart never touches these. MBC1 carts use them to map a
     //     16 KiB bank into the 0x4000-0x7FFF window. This is a *minimal* MBC1: ROM-bank
     //     selection only, enough for the multi-bank Blargg test ROMs (and small MBC1
-    //     games). Full MBC1 (RAM banking, the banking-mode flag, save RAM) is M7. ---
+    //     games). Full MBC1 (RAM banking, the banking-mode flag, save RAM) is a stretch goal. ---
     mbc1: bool,
     rom_bank: usize,      // bank currently mapped at 0x4000-0x7FFF (forced >= 1)
     rom_bank_mask: usize, // (bank_count - 1); keeps a selected bank inside the real ROM

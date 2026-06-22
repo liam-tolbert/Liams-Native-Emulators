@@ -1,4 +1,4 @@
-//! The MIPS R3000A CPU core — the interpreter (milestone M1).
+//! The MIPS R3000A CPU core — the interpreter.
 //!
 //! `Cpu::step()` runs exactly one instruction and returns how many CPU cycles it took, then
 //! ticks the bus by that much (the "catch-up" timing seam, identical in shape to the Game Boy
@@ -57,14 +57,14 @@ pub struct Cpu {
     pub lo: u32, // low half of a multiply / quotient of a divide
 
     /// Cycles consumed by the instruction running this step. Most are a flat cost; multiply and
-    /// divide take many more. Timing isn't load-bearing yet (nothing time-based runs until M4),
+    /// divide take many more. Timing isn't load-bearing yet (nothing time-based runs yet),
     /// but the seam is here so it can tighten later without touching callers.
     cycles: u32,
 
     pub cop0: Cop0, // COP0 is part of the CPU, so the CPU owns it (unlike the DMG's bus-owned IRQs)
 
     /// When true, snoop BIOS `std_out_putchar` calls and copy the character into the captured TTY
-    /// stream — the hook that lets the headless M3 harness read whatever a booting BIOS or a
+    /// stream — the hook that lets the headless TTY harness read whatever a booting BIOS or a
     /// sideloaded test program prints. Left off for the `selftest` (whose tiny hand-written programs
     /// never call the BIOS), so the tap costs nothing there. See the snoop in `step()`.
     pub capture_tty: bool,
@@ -124,7 +124,7 @@ impl Cpu {
         self.delay_slot = self.branch;
         self.branch = false; // the instruction we run now may set it again
 
-        // ---- BIOS TTY tap (M3) ---------------------------------------------------------------
+        // ---- BIOS TTY tap ---------------------------------------------------------------
         // How does a PS1 program print text? There's no console by default, but the BIOS provides a
         // "kernel TTY" (a debug serial terminal) plus a putchar routine to write to it. The catch:
         // the PS1 kernel does NOT expose its functions as numbered SYSCALLs. Instead it publishes
@@ -158,8 +158,8 @@ impl Cpu {
         // places on purpose: `Irq::pending()` ANDs I_STAT with I_MASK (the *controller* decides
         // which sources are allowed to pull the line at all), and `interrupt_pending()` then ANDs
         // Cause.IP against SR.IM (the *CPU* decides whether it is listening to line IP2). A real
-        // interrupt has to survive both. (M1 had no caller for `Irq::raise`, so this line stayed
-        // low; the M2 self-test now drives the whole chain end-to-end.)
+        // interrupt has to survive both. (Early on there was no caller for `Irq::raise`, so this
+        // line stayed low; the self-test now drives the whole chain end-to-end.)
         self.cop0.set_hw_irq(self.bus.irq.pending());
 
         if self.cop0.irq_enabled() && self.cop0.interrupt_pending() {
@@ -214,7 +214,7 @@ impl Cpu {
 
     /// A COPn / LWCn / SWCn op for coprocessor `n`. If software has marked the coprocessor usable
     /// (its SR.CU bit, or kernel mode for COP0), we accept it — there's nothing to do yet for the
-    /// absent COP1/COP3, and the GTE's (COP2) data moves arrive in M5 — otherwise it raises
+    /// absent COP1/COP3, and the GTE's (COP2) data moves arrive later — otherwise it raises
     /// Coprocessor Unusable. Gating on the usable bit, rather than always faulting, is what makes
     /// cpu/cop's "enabled" cases pass.
     fn cop_op(&mut self, n: u32) {
@@ -222,7 +222,7 @@ impl Cpu {
         // (MFC0/MTC0/RFE in the 0x10 arm), the load/store-coprocessor forms do NOT inherit COP0's
         // kernel-mode exemption — cpu/cop's testSwc0Disabled shows SWC0 faulting in kernel mode when
         // CU0 is clear, even though a kernel-mode MFC0 right next to it would not. When the bit is
-        // set there's nothing to do yet (no FPU; the GTE's COP2 moves arrive in M5); when it's clear
+        // set there's nothing to do yet (no FPU; the GTE's COP2 moves arrive later); when it's clear
         // it's Coprocessor Unusable.
         if self.cop0.sr & (1 << (28 + n)) == 0 {
             self.cop_unusable(n);
@@ -625,7 +625,7 @@ impl Cpu {
 
             // ---- the other coprocessors: COP1/COP2/COP3 and their load/store forms ----
             // The PS1 has no COP1 (FPU) or COP3, and COP2 is the GTE (the geometry engine — arrives
-            // in M5). Whether one of these faults depends ONLY on the matching SR.CUn "usable" bit,
+            // later). Whether one of these faults depends ONLY on the matching SR.CUn "usable" bit,
             // not on whether we've implemented it: if software enabled the coprocessor the op is
             // accepted (and, for now, does nothing); if not, it raises Coprocessor Unusable. The low
             // nibble of the primary opcode is the coprocessor number — COPn = 0x10+n, LWCn = 0x30+n,

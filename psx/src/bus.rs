@@ -70,7 +70,7 @@ pub struct Bus {
     mem_control: [u32; 0x24], // 0x1F801000-0x1F80105F + RAM_SIZE/cache regs, just stored
     cache_control: u32,       // 0xFFFE0130
 
-    /// Everything the BIOS has printed over the kernel TTY. The M3 harness watches this for
+    /// Everything the BIOS has printed over the kernel TTY. The TTY harness watches this for
     /// a "Passed"/"Failed" verdict — the direct analog of the Game Boy's `serial_out`.
     pub tty_out: String,
 }
@@ -90,7 +90,7 @@ impl Bus {
         }
     }
 
-    /// Load the 512 KiB BIOS image (M3). Reset puts PC at 0xBFC00000, the start of this ROM.
+    /// Load the 512 KiB BIOS image. Reset puts PC at 0xBFC00000, the start of this ROM.
     pub fn load_bios(&mut self, bytes: Vec<u8>) {
         self.bios = bytes;
     }
@@ -111,7 +111,7 @@ impl Bus {
     /// Advance the time-based subsystems by `cycles` CPU cycles (the "catch-up" seam, called from
     /// `cpu.step` after every instruction — exactly the DMG shape). The GPU keeps the video clock; when
     /// it crosses a frame boundary it asks for the **VBlank** interrupt, which the BIOS/games service to
-    /// run their per-frame loop. (Root counters/timers will hang off here too, in M4.5.)
+    /// run their per-frame loop. (Root counters/timers will hang off here too, later.)
     pub fn tick(&mut self, cycles: u32) {
         if self.gpu.tick(cycles) {
             self.irq.raise(crate::irq::source::VBLANK);
@@ -128,7 +128,7 @@ impl Bus {
         }
     }
 
-    // ===== DMA engine (M4c) =============================================================
+    // ===== DMA engine =============================================================
     // The register file lives in `dma.rs`; the *transfer* lives here, because moving a block touches
     // RAM, the GPU, and the interrupt controller at once and only the bus owns all three. A CHCR
     // write that sets a channel's start bit (caught in `io_write`) is what kicks it off.
@@ -356,9 +356,9 @@ impl Bus {
 
     // ===== Hardware I/O registers (0x1F801000-0x1F801FFF) ===============================
     // Only the registers the BIOS prods during early boot are real; the rest are stubbed so
-    // a poll loop sees a sane value and moves on. Each gets fleshed out in its own milestone.
+    // a poll loop sees a sane value and moves on. Each gets fleshed out as the matching device lands.
     //
-    // DOCUMENTED GAP (M2): `width` is currently ignored — every register is treated as a plain
+    // DOCUMENTED GAP: `width` is currently ignored — every register is treated as a plain
     // 32-bit word, and the CPU's load opcode does any byte/half narrowing on the value we return.
     // A few real registers behave differently per access width (e.g. byte vs. word reads of some
     // device ports), and I_STAT/I_MASK are physically 16-bit so their upper half reads back 0
@@ -372,7 +372,7 @@ impl Bus {
             0x074 => self.irq.read_mask() as u32, // I_MASK
             0x0F4 => self.dma.dicr_read(),        // DICR: bit 31 (master flag) is computed, not stored
             0x080..=0x0FF => self.dma.read(offset - 0x080),
-            0x100..=0x12F => 0, // timers (M4)
+            0x100..=0x12F => 0, // timers
             0x810 => self.gpu.read(),    // GPUREAD
             0x814 => self.gpu.status(),  // GPUSTAT
             0xC00..=0xFFF => 0, // SPU (deferred, like the DMG APU)
@@ -393,7 +393,7 @@ impl Bus {
                 self.dma.write(dma_off, val);
                 self.dma_maybe_trigger(dma_off, val);
             }
-            0x100..=0x12F => {} // timers (M4)
+            0x100..=0x12F => {} // timers
             0x810 => self.gpu.gp0(val),
             0x814 => self.gpu.gp1(val),
             0xC00..=0xFFF => {} // SPU
