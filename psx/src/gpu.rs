@@ -84,6 +84,9 @@ pub struct Gpu {
     poly_prev_pt: (i32, i32),
     poly_prev_col: (i32, i32, i32),
     poly_pending_col: (i32, i32, i32),
+    /// Semi-transparency mode for the polyline in progress (`None` = opaque). The command byte isn't
+    /// in scope in the drain, so it's latched here when the polyline is seeded.
+    poly_semi: Option<u8>,
 
     // ===== draw state (set by GP0 E1-E6; read back by the rasterizer in M4d) =============
     /// GP0(E1) "draw mode": texture-page base, semi-transparency mode, texture colour depth,
@@ -171,6 +174,7 @@ impl Gpu {
             poly_prev_pt: (0, 0),
             poly_prev_col: (0, 0, 0),
             poly_pending_col: (0, 0, 0),
+            poly_semi: None,
             draw_mode: 0,
             tex_window: 0,
             draw_area_left: 0,
@@ -246,7 +250,7 @@ impl Gpu {
     ///   3. **Mask force** (GP0(E6) bit 0) — OR the mask bit into whatever we do write.
     /// (The `02` FILL deliberately bypasses all three — see `execute_gp0` — which is why it doesn't
     /// call here.) The seam marked below is where M4d-3 semi-transparency will blend against `dst`.
-    fn plot(&mut self, x: i32, y: i32, color: u16) {
+    fn plot(&mut self, x: i32, y: i32, color: u16, semi: Option<u8>) {
         if x < self.draw_area_left as i32
             || x > self.draw_area_right as i32
             || y < self.draw_area_top as i32
@@ -258,8 +262,14 @@ impl Gpu {
         if self.check_mask && dst & 0x8000 != 0 {
             return;
         }
-        // --- M4d-3 semi-transparency seam: out = blend(color, dst, semi_mode) goes here -----------
-        let out = if self.force_set_mask { color | 0x8000 } else { color };
+        // Semi-transparency (M4d-3): when `semi` is set, blend the incoming colour against the
+        // destination (`dst` = "back", `color` = "front") per the active mode, keeping the *source*
+        // mask bit (the texel STP, or 0 for untextured). `None` = the opaque path.
+        let blended = match semi {
+            Some(mode) => (blend(dst, color, mode) & 0x7FFF) | (color & 0x8000),
+            None => color,
+        };
+        let out = if self.force_set_mask { blended | 0x8000 } else { blended };
         self.vram_set(x, y, out);
     }
 
@@ -460,6 +470,7 @@ impl Gpu {
                     cur_col,
                     self.poly_is_gouraud,
                     dither,
+                    self.poly_semi,
                 );
             }
             self.poly_prev_pt = cur;
@@ -484,6 +495,7 @@ impl Gpu {
             if (0x40..=0x5F).contains(&cmd) && cmd & 0x08 != 0 {
                 self.gp0_polyline = true;
                 self.poly_is_gouraud = cmd & 0x10 != 0;
+                self.poly_semi = (cmd & 0x02 != 0).then(|| ((self.draw_mode >> 5) & 3) as u8);
                 self.poly_pending_col = rgb_channels(word);
                 self.poly_prev_col = self.poly_pending_col;
                 self.poly_have_prev = false;
@@ -793,6 +805,9 @@ impl Gpu {
 
         // Dithering applies to Gouraud and to textured pixels when GP0(E1) bit 9 is set.
         let dither = (gouraud || textured) && (self.draw_mode >> 9) & 1 != 0;
+        // Semi-transparency: enabled by command bit 1; the mode is the (possibly just-latched)
+        // draw-mode field — so this is read *after* the texpage latch above.
+        let semi = (cmd & 0x02 != 0).then(|| ((self.draw_mode >> 5) & 3) as u8);
 
         // A quad is two triangles sharing the v1-v2 edge; colour AND U/V split the same way, so the
         // texture is continuous across the diagonal.
@@ -803,6 +818,7 @@ impl Gpu {
             tex,
             gouraud,
             dither,
+            semi,
         );
         if quad {
             self.draw_triangle(
@@ -812,6 +828,7 @@ impl Gpu {
                 tex,
                 gouraud,
                 dither,
+                semi,
             );
         }
     }
@@ -828,7 +845,8 @@ impl Gpu {
             (ca, self.decode_vertex(self.gp0_buffer[2]))
         };
         let dither = gouraud && (self.draw_mode >> 9) & 1 != 0;
-        self.draw_line(a, b, ca, cb, gouraud, dither);
+        let semi = (cmd & 0x02 != 0).then(|| ((self.draw_mode >> 5) & 3) as u8);
+        self.draw_line(a, b, ca, cb, gouraud, dither, semi);
     }
 
     /// Decode and draw a rectangle/sprite (0x60-0x7F). Flat untextured = a solid fill; textured =
@@ -847,6 +865,7 @@ impl Gpu {
             _ => (16, 16),
         };
 
+        let semi = (cmd & 0x02 != 0).then(|| ((self.draw_mode >> 5) & 3) as u8);
         // draw_mode bit 11 already reflects the GP1(09) gate (applied at write time), so it alone
         // tells us whether texturing is disabled for this sprite.
         let tex_disabled = (self.draw_mode >> 11) & 1 != 0;
@@ -862,10 +881,10 @@ impl Gpu {
             let xflip = (self.draw_mode >> 12) & 1 != 0; // GP0(E1) bit 12 — mirror horizontally
             let yflip = (self.draw_mode >> 13) & 1 != 0; // GP0(E1) bit 13 — mirror vertically
             let col = rgb_channels(self.gp0_buffer[0]);
-            self.draw_tex_rect(px, py, w, h, base_u, base_v, &tex, xflip, yflip, col);
+            self.draw_tex_rect(px, py, w, h, base_u, base_v, &tex, xflip, yflip, col, semi);
         } else {
             let color = rgb24_to_15(self.gp0_buffer[0]);
-            self.draw_rect(px, py, w, h, color);
+            self.draw_rect(px, py, w, h, color, semi);
         }
     }
 
@@ -885,6 +904,7 @@ impl Gpu {
         xflip: bool,
         yflip: bool,
         col: (i32, i32, i32),
+        semi: Option<u8>,
     ) {
         for dy in 0..h {
             // Flip walks the texel coords *downward* from the base; `sample_texel` masks U/V to 8 bits,
@@ -899,7 +919,9 @@ impl Gpu {
                     continue; // fully-black texel is transparent
                 }
                 let out = modulate(texel, col.0, col.1, col.2, x + dx, y + dy, false);
-                self.plot(x + dx, y + dy, out); // ... then the &mut self write
+                // Blend only where the texel's STP bit is set (and the sprite is semi-transparent).
+                let s = if texel & 0x8000 != 0 { semi } else { None };
+                self.plot(x + dx, y + dy, out, s); // ... then the &mut self write
             }
         }
     }
@@ -923,6 +945,7 @@ impl Gpu {
         tex: Option<TexInfo>,
         gouraud: bool,
         dither: bool,
+        semi: Option<u8>,
     ) {
         let xs = [v[0].0, v[1].0, v[2].0];
         let ys = [v[0].1, v[1].1, v[2].1];
@@ -993,10 +1016,12 @@ impl Gpu {
                         continue; // a fully-black texel is transparent — leave VRAM untouched
                     }
                     let out = modulate(texel, cr, cg, cb, x, y, dither);
-                    self.plot(x, y, out); // ... then the &mut self write
+                    // Blend only where the texel's STP bit is set (and the prim is semi-transparent).
+                    let s = if texel & 0x8000 != 0 { semi } else { None };
+                    self.plot(x, y, out, s); // ... then the &mut self write
                 } else {
                     let color = if gouraud { shade(x, y, cr, cg, cb, dither) } else { flat };
-                    self.plot(x, y, color);
+                    self.plot(x, y, color, semi);
                 }
             }
         }
@@ -1004,10 +1029,10 @@ impl Gpu {
 
     /// Fill an axis-aligned rectangle / sprite in a flat colour (no shading, no dither). Honours the
     /// scissor and mask via `plot`.
-    fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u16) {
+    fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u16, semi: Option<u8>) {
         for yy in 0..h {
             for xx in 0..w {
-                self.plot(x + xx, y + yy, color);
+                self.plot(x + xx, y + yy, color, semi);
             }
         }
     }
@@ -1023,6 +1048,7 @@ impl Gpu {
         cb: (i32, i32, i32),
         gouraud: bool,
         dither: bool,
+        semi: Option<u8>,
     ) {
         if (a.0 - b.0).abs() > 1023 || (a.1 - b.1).abs() > 511 {
             return;
@@ -1054,7 +1080,7 @@ impl Gpu {
             } else {
                 flat
             };
-            self.plot(x, y, color);
+            self.plot(x, y, color, semi);
             if x == b.0 && y == b.1 {
                 break;
             }
@@ -1099,6 +1125,25 @@ fn shade(x: i32, y: i32, r: i32, g: i32, b: i32, dither: bool) -> u16 {
     let d = if dither { DITHER[(y & 3) as usize][(x & 3) as usize] } else { 0 };
     let ch = |v: i32| ((v + d).clamp(0, 255) >> 3) as u16;
     ch(r) | (ch(g) << 5) | (ch(b) << 10)
+}
+
+/// Blend an incoming pixel (`front`) over the existing VRAM pixel (`back`) per the GP0(E1)
+/// semi-transparency mode, per 5-bit channel. **Gotcha: all four modes truncate** (no rounding bias)
+/// — getting the `>>1`/`>>2` shifts or the clamps wrong shows up as off-by-one across a whole
+/// gradient in `gpu/transparency`. The mask/STP bit (15) is the caller's job; we only touch colour.
+fn blend(back: u16, front: u16, mode: u8) -> u16 {
+    let chan = |shift: u32| {
+        let b = ((back >> shift) & 0x1F) as i32; // & 0x1F so a stray bit-15 never leaks into a channel
+        let f = ((front >> shift) & 0x1F) as i32;
+        let out = match mode {
+            0 => (b + f) >> 1,           // B/2 + F/2 (truncated; max 31, no clamp needed)
+            1 => (b + f).min(31),        // B + F
+            2 => (b - f).max(0),         // B - F
+            _ => (b + (f >> 2)).min(31), // B + F/4 (F/4 truncated before the add)
+        };
+        out as u16
+    };
+    chan(0) | (chan(5) << 5) | (chan(10) << 10)
 }
 
 /// Edge function: twice the signed area of triangle `(a, b, p)`. Its sign says which side of the

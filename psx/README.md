@@ -10,9 +10,12 @@ hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) 
 > the way the BIOS loader would, runs it, and diffs the captured TTY against the test's golden
 > `psx.log` (the JaCzekanski `ps1-tests` **`cpu/cop`** test passes). The GPU is now well underway:
 > **M4a** (VRAM + GP0/GP1 model + GPUSTAT + the PNG verify harness), **M4b** (VRAM transfer & fill
-> commands), and **M4c** (DMA channels 2 + 6 + the DMA interrupt — `dma/otc-test` passes) are done.
-> **Next is the rasterizer (M4d)** — the GP0 drawing primitives that turn those DMA-delivered command
-> lists into pixels (see the M4 plan below).
+> commands), **M4c** (DMA channels 2 + 6 + the DMA interrupt — `dma/otc-test` passes), and the **full
+> rasterizer (M4d)** — flat/Gouraud/textured polygons, rectangles/sprites, lines, and the four
+> semi-transparency blend modes — are done. `gpu/clipping`, `quad`, `texture-overflow`, and
+> `texture-flip` render **pixel-exact**, and `gpu/gp0-e1` passes 10/10. **Next is M4e** — display
+> timing (VBlank) and a `minifb` window, whose demo target is the **BIOS Sony logo on screen** (see
+> the M4 plan below).
 
 ## Roadmap
 
@@ -26,8 +29,8 @@ hardware documentation ([Nocash psx-spx](https://problemkaputt.de/psx-spx.htm)) 
 | ↳ M4a | VRAM + GP0/GP1 command model + real GPUSTAT + the PNG verify harness | **done** |
 | ↳ M4b | VRAM transfer & fill commands (`02` / `A0` / `C0` / `80`) | **done** |
 | ↳ M4c | DMA channels 2 (GPU) + 6 (OTC) + the DMA interrupt | **done** |
-| ↳ M4d | software rasterizer (polygons, rectangles, lines, textures) | next |
-| ↳ M4e | display timing (VBlank) + the `minifb` window → BIOS-logo demo | later |
+| ↳ M4d | software rasterizer (polygons, rectangles, lines, textures, semi-transparency) | **done** |
+| ↳ M4e | display timing (VBlank) + the `minifb` window → BIOS-logo demo | next |
 | **M4.5** | Root counters / timers (TIMER0/1/2) | later |
 | M5+ | GTE, CD-ROM, SPU audio, controllers, then a dynamic recompiler (JIT) | later |
 
@@ -56,10 +59,12 @@ M4 is built in five stages, each planned and implemented on its own so the diff 
   every `gpu/` ROM drives the GPU via DMA, so it's what makes the M4b transfers (and then the M4d
   rasterizer) validate against the reference images. (Moved ahead of the rasterizer for exactly this
   reason — discovered during M4b that the ROMs never touch the GP0 port directly.)
-- **M4d — the software rasterizer (next)** (flat/Gouraud/textured polygons, rectangles/sprites, lines;
-  plus semi-transparency, dithering, and the mask bit). Built in its own sub-stages: **M4d-1** the
+- **M4d — the software rasterizer (done)** (flat/Gouraud/textured polygons, rectangles/sprites, lines;
+  plus semi-transparency, dithering, and the mask bit). Built in three sub-stages: **M4d-1** the
   untextured primitives (polygons, rectangles, lines + the shared clip/offset/mask/dither pipeline),
-  then textures, then semi-transparency.
+  **M4d-2** textures (4/8/15bpp + CLUT, U/V interpolation, the texture window, modulation, sprite
+  flips), and **M4d-3** the four semi-transparency blend modes. Validated by pixel-exact VRAM diffs
+  against the `gpu/` reference PNGs (`clipping`/`quad`/`triangle`/`texture-overflow`/`texture-flip`).
 - **M4e — display timing + window**: the ~60 Hz VBlank tick that drives game loops, and a `minifb`
   window. Demo target: the real BIOS booting to its **Sony Computer Entertainment logo** on screen —
   that logo is GPU-drawn, so a correct M4 renders it with no game or CD-ROM needed.
