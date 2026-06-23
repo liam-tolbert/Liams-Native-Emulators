@@ -25,6 +25,7 @@
 #![allow(dead_code)]
 
 mod bus;
+mod cdrom;
 mod cop0;
 mod cpu;
 mod dma;
@@ -32,10 +33,12 @@ mod exe;
 mod gpu;
 mod img;
 mod irq;
+mod iso;
 mod selftest;
 mod timer;
 
 use bus::Bus;
+use cdrom::CdImage;
 use cpu::Cpu;
 use exe::PsxExe;
 
@@ -60,6 +63,7 @@ fn main() {
         eprintln!("  {me} selftest              run the built-in CPU self-test");
         eprintln!("  {me} <bios.bin> <game.exe>  sideload a PS-EXE, run to a verdict");
         eprintln!("  {me} <bios.bin> dump [N]    headless: run N frames -> VRAM PNG");
+        eprintln!("  {me} <bios.bin> disc <.cue>  boot a real disc off its image (HLE)");
         std::process::exit(1);
     }
 
@@ -120,6 +124,7 @@ fn main() {
             let frames = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(120);
             run_dump(&mut cpu, frames);
         }
+        Some("disc") => run_disc(&mut cpu, args.get(3).map(String::as_str)),
         Some(other) => {
             run_sideload(&mut cpu, other);
         }
@@ -477,6 +482,37 @@ const SENTINEL_RA: u32 = 0x0000_0000;
 /// neither prints its end-marker nor returns.
 const RUN_BUDGET: u64 = 50_000_000;
 
+/// Inject a parsed PS-EXE into the booted machine and hand-set the registers to the state the BIOS
+/// loader leaves behind, so the program starts exactly as if the BIOS had loaded it off a disc.
+/// Shared by the PS-EXE sideload and the real-disc (`disc`) boot — both reach the same `0x80030000`
+/// hand-off and differ only in *where the EXE came from*. Each value comes from the PS-EXE header
+/// (parsed in exe.rs):
+///   * pc        — the entry point. We also prime next_pc/current_pc because the CPU core runs a
+///                 two-PC model for branch-delay slots (next_pc is always "one instruction past pc");
+///                 leaving them stale would mis-handle the very first branch.
+///   * r28 (gp)  — the "global pointer", a base register compiled C uses to reach its globals.
+///   * r29 (sp), r30 (fp) — stack and frame pointers. IMPORTANT gotcha: a header SP of 0 means "leave
+///                 SP alone, use the one the kernel set up." Writing 0 would send the first stack push
+///                 to address 0 and trample the kernel — so when the header SP is 0 we keep the BIOS's
+///                 value (exactly why both paths boot the real BIOS first).
+///   * r4 (a0), r5 (a1) — the argc/argv-style pair the BIOS hands a freshly-loaded program.
+///   * r31 (ra)  — a recognisable sentinel return address, so a program that returns (`jr ra`)
+///                 instead of looping lands somewhere we can detect rather than running off into noise.
+fn inject_exe(cpu: &mut Cpu, exe: &PsxExe) {
+    cpu.bus.store_ram(exe.load_addr, &exe.data);
+    cpu.pc = exe.initial_pc;
+    cpu.next_pc = exe.initial_pc.wrapping_add(4);
+    cpu.current_pc = exe.initial_pc;
+    cpu.regs[28] = exe.initial_gp;
+    if exe.initial_sp != 0 {
+        cpu.regs[29] = exe.initial_sp;
+        cpu.regs[30] = exe.initial_sp;
+    }
+    cpu.regs[4] = 1;
+    cpu.regs[5] = 0;
+    cpu.regs[31] = SENTINEL_RA;
+}
+
 /// Sideload a PS-EXE: boot the BIOS to the hand-off point (so the kernel tables and a valid stack
 /// exist), inject the image and set the registers the BIOS loader would, run with TTY capture until
 /// the program ends, then diff the captured TTY against the sibling `psx.log` golden log.
@@ -504,34 +540,9 @@ fn run_sideload(cpu: &mut Cpu, exe_path: &str) {
         std::process::exit(1);
     }
 
-    // 2. Inject: copy the program image into RAM and hand-set the registers to the state the BIOS
-    //    loader leaves behind, so the EXE starts exactly as if the BIOS had loaded it off a disc.
-    //    Each value comes from the PS-EXE header (parsed in exe.rs):
-    //      * pc        — the entry point. We also prime next_pc/current_pc because the CPU core runs
-    //                    a two-PC model for branch-delay slots (next_pc is always "one instruction
-    //                    past pc"); leaving them stale would mis-handle the very first branch.
-    //      * r28 (gp)  — the "global pointer", a base register compiled C uses to reach its globals.
-    //      * r29 (sp), r30 (fp) — stack and frame pointers. IMPORTANT gotcha: these test EXEs carry
-    //                    an SP of 0 in their header, which by the format means "leave SP alone, use
-    //                    the one the kernel set up." If we wrote 0 into SP, the program's first stack
-    //                    push would hit address 0 and trample the kernel — so when the header SP is 0
-    //                    we deliberately keep the BIOS's value (this is exactly why we boot the real
-    //                    BIOS first, in step 1).
-    //      * r4 (a0), r5 (a1) — the argc/argv-style pair the BIOS hands a freshly-loaded program.
-    //      * r31 (ra)  — the return address. We plant a recognisable sentinel so that if the program
-    //                    returns (`jr ra`) instead of looping forever, PC lands there and we can stop.
-    cpu.bus.store_ram(exe.load_addr, &exe.data);
-    cpu.pc = exe.initial_pc;
-    cpu.next_pc = exe.initial_pc.wrapping_add(4);
-    cpu.current_pc = exe.initial_pc;
-    cpu.regs[28] = exe.initial_gp;
-    if exe.initial_sp != 0 {
-        cpu.regs[29] = exe.initial_sp;
-        cpu.regs[30] = exe.initial_sp;
-    }
-    cpu.regs[4] = 1;
-    cpu.regs[5] = 0;
-    cpu.regs[31] = SENTINEL_RA;
+    // 2. Inject the image and set the registers exactly as the BIOS loader would, so the EXE starts
+    //    as if the BIOS had loaded it off a disc. Shared with the real-disc boot path (`inject_exe`).
+    inject_exe(cpu, &exe);
 
     let tty_start = cpu.bus.tty_out.len(); // everything printed from here on is the EXE's
     println!(
@@ -658,6 +669,303 @@ fn print_diff(want: &[String], got: &[String]) {
                 break;
             }
         }
+    }
+}
+
+// ===== real-disc boot (HLE) ============================================================
+//
+// The genuine version of what the sideloader fakes: instead of taking a PS-EXE off the host
+// filesystem, we attach the game's CD image and read its boot executable straight off the disc, then
+// inject it at the same 0x80030000 hand-off. The CD-ROM *drive* (`cdrom.rs`) is real and the disc
+// stays inserted, so the running game can still stream its assets through it; only the disc
+// *filesystem* walk — finding SYSTEM.CNF and the SLUS executable — is done host-side here (`iso.rs`).
+// That's "HLE" (high-level emulation) boot: skip the BIOS shell's slow disc-scan, but run the real
+// game code. Pure-LLE (letting the BIOS shell boot the disc itself) is a later authenticity stretch.
+
+/// `disc` run-mode: attach a CD image, boot the BIOS to the hand-off, HLE-load the game's boot EXE off
+/// the disc, inject it, and run until it stalls — reporting where (the signal for the next milestone).
+fn run_disc(cpu: &mut Cpu, path_arg: Option<&str>) {
+    if !cpu.bus.bios_loaded() {
+        eprintln!("\n(disc boot needs a BIOS as the first argument — a 512 KiB image)");
+        std::process::exit(1);
+    }
+    let path = path_arg.unwrap_or_else(|| {
+        eprintln!("\n(usage: <bios.bin> disc <path-to-.cue or game dir>)");
+        std::process::exit(1);
+    });
+
+    // 1. Resolve the .cue (accept a .cue directly, or a directory holding exactly one) and attach it.
+    let cue = resolve_cue(path).unwrap_or_else(|| {
+        eprintln!("[disc] no .cue found at '{path}'");
+        std::process::exit(1);
+    });
+    let img = CdImage::from_cue(&cue).unwrap_or_else(|e| {
+        eprintln!("[disc] failed to open the disc image for '{}': {e}", cue.display());
+        std::process::exit(1);
+    });
+    println!(
+        "\n[disc] attached {} ({} sectors)",
+        cue.display(),
+        img.sector_count()
+    );
+    cpu.bus.cdrom.load_disc(img);
+
+    // 2. Boot the real BIOS to the exec hand-off, so the kernel tables + a valid stack exist.
+    cpu.capture_tty = true;
+    println!("[disc] booting BIOS to 0x{EXEC_POINT:08X} ...\n");
+    if run_until_pc(cpu, EXEC_POINT, BOOT_BUDGET).is_none() {
+        eprintln!("\n[disc] BIOS stalled before 0x{EXEC_POINT:08X}; cannot boot the disc.");
+        dump_regs(cpu);
+        std::process::exit(1);
+    }
+
+    // 3. HLE-load the boot executable off the disc's ISO9660 filesystem (exits with a reason on miss).
+    let exe = match load_boot_exe(cpu) {
+        Some(e) => e,
+        None => std::process::exit(1),
+    };
+
+    // 4. Inject exactly as the BIOS loader would (shared with the sideloader).
+    inject_exe(cpu, &exe);
+    println!(
+        "\n[disc] injected {} bytes at 0x{:08X} — entry 0x{:08X}, gp 0x{:08X}, sp 0x{:08X}\n",
+        exe.data.len(),
+        exe.load_addr,
+        exe.initial_pc,
+        exe.initial_gp,
+        cpu.regs[29]
+    );
+
+    // 5. Run the game's own code until it stalls, and report where (the M6-selecting signal).
+    let report = run_until_stall(cpu);
+    report.print(cpu);
+}
+
+/// Walk the attached disc's ISO9660 filesystem to find SYSTEM.CNF, read the `BOOT=` executable name,
+/// load that executable off the disc, and parse it as a PS-EXE. Returns `None` (after printing the
+/// reason) on any missing piece. Borrows the disc immutably — it stays inserted for the drive.
+fn load_boot_exe(cpu: &Cpu) -> Option<PsxExe> {
+    let disc = cpu.bus.cdrom.disc_ref()?;
+    let iso = iso::IsoReader::open(disc).or_else(|| {
+        eprintln!("[disc] not an ISO9660 volume (no CD001 at sector 16)");
+        None
+    })?;
+    let (cnf_lba, cnf_len) = iso.find_in_root("SYSTEM.CNF").or_else(|| {
+        eprintln!("[disc] SYSTEM.CNF not found in the disc root");
+        None
+    })?;
+    let cnf = String::from_utf8_lossy(&iso.read_file(cnf_lba, cnf_len)).into_owned();
+    println!("[disc] SYSTEM.CNF:\n{}", cnf.trim_end());
+    let boot = iso::parse_boot_filename(&cnf).or_else(|| {
+        eprintln!("[disc] no BOOT= line in SYSTEM.CNF");
+        None
+    })?;
+    let (exe_lba, exe_len) = iso.find_in_root(&boot).or_else(|| {
+        eprintln!("[disc] boot executable '{boot}' not found in the disc root");
+        None
+    })?;
+    println!("[disc] BOOT = {boot}  (lba {exe_lba}, {exe_len} bytes)");
+    let raw = iso.read_file(exe_lba, exe_len);
+    let magic = String::from_utf8_lossy(&raw[..raw.len().min(8)]).into_owned();
+    let exe = PsxExe::parse(&raw).or_else(|| {
+        eprintln!("[disc] '{boot}' off the disc isn't a PS-EXE (magic: {magic:?})");
+        None
+    })?;
+    println!(
+        "[disc] parsed PS-EXE off the disc — magic {magic:?}, pc 0x{:08X}, gp 0x{:08X}, load 0x{:08X}",
+        exe.initial_pc, exe.initial_gp, exe.load_addr
+    );
+    Some(exe)
+}
+
+/// Resolve the disc argument to a `.cue`: a `.cue` path directly, or a directory holding exactly one.
+fn resolve_cue(path: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(path);
+    if p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("cue")) {
+        return Some(p.to_path_buf());
+    }
+    if p.is_dir() {
+        let mut found = None;
+        for entry in std::fs::read_dir(p).ok()?.flatten() {
+            let q = entry.path();
+            if q.extension().is_some_and(|e| e.eq_ignore_ascii_case("cue")) {
+                if found.is_some() {
+                    return None; // more than one .cue — can't choose
+                }
+                found = Some(q);
+            }
+        }
+        return found;
+    }
+    None
+}
+
+/// Why the post-boot run stopped — the signal that picks the next milestone. `pc`/`instr` name the
+/// instruction the report is about (the faulting one for a fault loop, not the handler).
+struct StallReport {
+    pc: u32,
+    instr: u32,
+    reason: String,
+    steps: u64,
+}
+
+impl StallReport {
+    fn print(&self, cpu: &Cpu) {
+        println!(
+            "\n[disc] game code ran {} instructions, then stalled.",
+            self.steps
+        );
+        println!(
+            "[disc] STALL @ pc=0x{:08X}  instr=0x{:08X}  — {}",
+            self.pc, self.instr, self.reason
+        );
+        let tty = cpu.bus.tty_out.trim_end();
+        if !tty.is_empty() {
+            let lines: Vec<&str> = tty.lines().collect();
+            let start = lines.len().saturating_sub(8);
+            println!("----- last TTY -----\n{}\n--------------------", lines[start..].join("\n"));
+        }
+        dump_regs(cpu);
+    }
+}
+
+/// Name a COP0 exception cause code (the low part the `disc` stall report cares about).
+fn exc_name(code: u32) -> &'static str {
+    match code {
+        0x00 => "interrupt",
+        0x04 => "address error (load)",
+        0x05 => "address error (store)",
+        0x06 => "bus error (instr fetch)",
+        0x07 => "bus error (data)",
+        0x08 => "syscall",
+        0x09 => "breakpoint",
+        0x0A => "reserved/illegal instruction",
+        0x0B => "coprocessor unusable",
+        0x0C => "arithmetic overflow",
+        _ => "other",
+    }
+}
+
+/// Step the injected game until it stops making forward progress, classifying *why* — the whole point
+/// of this stage is to learn where the game's own code first needs hardware we haven't built.
+///
+/// Exceptions are NORMAL here: the game makes BIOS syscalls, and each one transiently lands at the
+/// exception vector before the real kernel handler returns via RFE — so a single visit to 0x80000080
+/// is *not* a stall. We only flag a fault that *repeats on the same EPC*, which means the handler
+/// keeps returning to an instruction that immediately re-faults (an op or feature we don't emulate).
+/// Stops on the first of: the null sentinel (exit); an un-emulated GTE/COP2 instruction at PC (the
+/// expected first wall — M6 — caught *before* it runs so we name it); a single PC spinning (a poll
+/// wait on a device that never changes, e.g. the stubbed SPU); a repeated same-EPC fault (reported
+/// with its cause); or the instruction budget.
+fn run_until_stall(cpu: &mut Cpu) -> StallReport {
+    const SPIN_LIMIT: u64 = 2_000_000; // the same PC this many steps == a spin/poll wait
+    const FAULT_LIMIT: u64 = 2_048; // the same instruction faulting this many times == stuck
+    const PLATEAU_LIMIT: u64 = 24_000_000; // no new RAM code + no TTY this long == stuck looping
+    let mut last_pc = cpu.pc;
+    let mut same_pc = 0u64;
+    let mut fault_epc = u32::MAX;
+    let mut fault_reps = 0u64;
+    let mut max_ram_pc = 0u32;
+    let mut plateau = 0u64;
+    let mut tty_len = cpu.bus.tty_out.len();
+    for i in 0..RUN_BUDGET {
+        let pc = cpu.pc;
+
+        if pc == SENTINEL_RA {
+            return StallReport {
+                pc,
+                instr: 0,
+                reason: "returned to the null sentinel (program exited / jumped to 0)".into(),
+                steps: i,
+            };
+        }
+
+        // An un-emulated GTE/COP2 op is the wall we expect to hit first; catch it before it runs.
+        let instr = cpu.bus.read32(pc);
+        let gte = match instr >> 26 {
+            0x12 => Some("un-emulated COP2/GTE instruction — selects M6 (the GTE)"),
+            0x32 => Some("un-emulated LWC2 (GTE load) — selects M6 (the GTE)"),
+            0x3A => Some("un-emulated SWC2 (GTE store) — selects M6 (the GTE)"),
+            _ => None,
+        };
+        if let Some(reason) = gte {
+            return StallReport { pc, instr, reason: reason.into(), steps: i };
+        }
+
+        // A PC that stops advancing is a spin-wait on something that never changes (a poll loop).
+        if pc == last_pc {
+            same_pc += 1;
+        } else {
+            same_pc = 0;
+            last_pc = pc;
+        }
+        if same_pc > SPIN_LIMIT {
+            return StallReport {
+                pc,
+                instr,
+                reason: "spinning on one PC (a poll wait — likely the stubbed SPU or a CD wait)".into(),
+                steps: i,
+            };
+        }
+
+        // Forward-progress watchdog: the highest PC reached *in the RAM code region* climbs while the
+        // game is still reaching new code and plateaus once it's stuck looping — even a loop that calls
+        // far into BIOS/kernel each pass, since those ROM addresses fall outside the window and are
+        // ignored. No new RAM code AND no new TTY for a long stretch == a poll wait on hardware we don't
+        // drive yet. (A productive init/memset reaches new code or prints again well within the limit.)
+        let in_ram_code = (0x8001_0000..0x8020_0000).contains(&pc);
+        let tty_now = cpu.bus.tty_out.len();
+        if (in_ram_code && pc > max_ram_pc) || tty_now != tty_len {
+            if in_ram_code && pc > max_ram_pc {
+                max_ram_pc = pc;
+            }
+            tty_len = tty_now;
+            plateau = 0;
+        } else {
+            plateau += 1;
+            if plateau > PLATEAU_LIMIT {
+                return StallReport {
+                    pc,
+                    instr,
+                    reason: format!(
+                        "no new RAM code or TTY for >{PLATEAU_LIMIT} instrs (furthest reached 0x{max_ram_pc:08X}) — a poll wait on hardware we don't drive yet"
+                    ),
+                    steps: i,
+                };
+            }
+        }
+
+        cpu.step();
+
+        // A fault that keeps re-firing on the same EPC is unrecoverable: the handler returns and the
+        // game immediately re-faults on something we don't handle. Report the faulting instruction.
+        if cpu.pc == 0x8000_0080 {
+            let epc = cpu.cop0.epc;
+            if epc == fault_epc {
+                fault_reps += 1;
+            } else {
+                fault_epc = epc;
+                fault_reps = 1;
+            }
+            if fault_reps > FAULT_LIMIT {
+                let code = (cpu.cop0.cause >> 2) & 0x1F;
+                return StallReport {
+                    pc: epc,
+                    instr: cpu.bus.read32(epc),
+                    reason: format!(
+                        "repeated {} (ExcCode 0x{code:02X}) faulting at this EPC — the game hit something we don't handle",
+                        exc_name(code)
+                    ),
+                    steps: i,
+                };
+            }
+        }
+    }
+    StallReport {
+        pc: cpu.pc,
+        instr: cpu.bus.read32(cpu.pc),
+        reason: "instruction budget exhausted (no obvious stall — may still be running)".into(),
+        steps: RUN_BUDGET,
     }
 }
 

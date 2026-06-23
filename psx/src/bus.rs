@@ -24,6 +24,7 @@
 //!   0xFFFE0130             cache-control register (KSEG2, never masked)
 //! ```
 
+use crate::cdrom::Cdrom;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::irq::Irq;
@@ -68,6 +69,7 @@ pub struct Bus {
     pub gpu: Gpu,
     pub dma: Dma,
     pub timers: Timers,
+    pub cdrom: Cdrom,
 
     mem_control: [u32; 0x24], // 0x1F801000-0x1F80105F + RAM_SIZE/cache regs, just stored
     cache_control: u32,       // 0xFFFE0130
@@ -87,6 +89,7 @@ impl Bus {
             gpu: Gpu::new(),
             dma: Dma::new(),
             timers: Timers::new(),
+            cdrom: Cdrom::new(),
             mem_control: [0; 0x24],
             cache_control: 0,
             tty_out: String::new(),
@@ -132,6 +135,11 @@ impl Bus {
             if fired & (1 << n) != 0 {
                 self.irq.raise(Timers::irq_source(n));
             }
+        }
+        // The CD-ROM drive answers commands on its own clock — its event queue advances here and, when
+        // it delivers an enabled interrupt, raises the CDROM line (I_STAT bit 2).
+        if self.cdrom.tick(cycles) {
+            self.irq.raise(crate::irq::source::CDROM);
         }
     }
 
@@ -196,6 +204,8 @@ impl Bus {
 
         let final_madr = if ch == 6 {
             self.run_dma_otc(madr, bcr)
+        } else if ch == 3 {
+            self.run_dma_cd(madr, bcr, chcr)
         } else {
             // Channel 2 (GPU): bit0 = direction (1 = RAM->GPU), bit1 = step, bits 9-10 = sync mode.
             let from_ram = chcr & 1 != 0;
@@ -282,6 +292,22 @@ impl Bus {
             addr = addr.wrapping_sub(4);
         }
         addr
+    }
+
+    /// Channel 3 (CD-ROM) — stream the loaded sector from the CD-ROM's data FIFO into RAM. The CD is a
+    /// device->RAM source only; like the GPU block transfer the word count is block-size x block-count
+    /// (BCR's two halves), and bit 1 of CHCR picks the address step. Each word is four little-endian
+    /// bytes popped off the data FIFO (which a `Request` want-data filled from the current sector).
+    fn run_dma_cd(&mut self, mut madr: u32, bcr: u32, chcr: u32) -> u32 {
+        let max = |n: u32| if n == 0 { 0x1_0000 } else { n };
+        let words = max(bcr & 0xFFFF) * max((bcr >> 16) & 0xFFFF);
+        let step: i32 = if chcr & 2 != 0 { -4 } else { 4 };
+        for _ in 0..words {
+            let w = self.cdrom.dma_read_word();
+            self.ram_write32(madr, w);
+            madr = madr.wrapping_add(step as u32);
+        }
+        madr
     }
 
     // ===== Address decode ===============================================================
@@ -390,6 +416,7 @@ impl Bus {
             0x0F4 => self.dma.dicr_read(),        // DICR: bit 31 (master flag) is computed, not stored
             0x080..=0x0FF => self.dma.read(offset - 0x080),
             0x100..=0x12F => self.timers.read(offset - 0x100),
+            0x800..=0x803 => self.cdrom.read(offset - 0x800), // CD-ROM controller (8-bit registers)
             0x810 => self.gpu.read(),    // GPUREAD
             0x814 => self.gpu.status(),  // GPUSTAT
             0xC00..=0xFFF => 0, // SPU (deferred, like the DMG APU)
@@ -411,6 +438,7 @@ impl Bus {
                 self.dma_maybe_trigger(dma_off, val);
             }
             0x100..=0x12F => self.timers.write(offset - 0x100, val),
+            0x800..=0x803 => self.cdrom.write(offset - 0x800, val),
             0x810 => self.gpu.gp0(val),
             0x814 => self.gpu.gp1(val),
             0xC00..=0xFFF => {} // SPU

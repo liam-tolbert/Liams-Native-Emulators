@@ -82,6 +82,41 @@ fn upload(g: &mut gpu::Gpu, x: u32, y: u32, w: u32, h: u32, pixels: &[u16]) {
     }
 }
 
+/// A 16-sector synthetic CD image: sector L's 2048-byte Mode2/Form1 user area (bytes 24..24+2048 of
+/// the raw 2352-byte sector) is filled with the byte `0xA0 + L`, so a read can be checked by value.
+fn synth_disc() -> crate::cdrom::CdImage {
+    let mut bytes = vec![0u8; 16 * 2352];
+    for l in 0..16usize {
+        let base = l * 2352 + 24;
+        for b in &mut bytes[base..base + 2048] {
+            *b = 0xA0 + l as u8;
+        }
+    }
+    crate::cdrom::CdImage::from_bin(bytes)
+}
+
+/// Drive a fresh `bus` to "streaming sector 0": load the synth disc, Setloc LBA 0, issue ReadN,
+/// then ack the INT3 acknowledge — leaving the queue armed for the first INT1 with the index at 1.
+/// The ReadN case below spells this whole dance out as the canonical walk-through; the DMA-ch3 and
+/// Pause cases (whose point is *downstream* of the read starting) call this so their setup doesn't
+/// drown out what they actually check.
+fn cd_begin_read(bus: &mut Bus) {
+    bus.cdrom.load_disc(synth_disc());
+    bus.write32(0x1F80_1800, 0);
+    for p in [0x00, 0x02, 0x00] {
+        bus.write32(0x1F80_1802, p); // Setloc MM:SS:FF = 00:02:00 -> LBA 0
+    }
+    bus.write32(0x1F80_1801, 0x02); // Setloc
+    bus.tick(60_000);
+    bus.write32(0x1F80_1800, 1);
+    bus.write32(0x1F80_1803, 0x07); // ack Setloc
+    bus.write32(0x1F80_1800, 0);
+    bus.write32(0x1F80_1801, 0x06); // ReadN
+    bus.tick(60_000);
+    bus.write32(0x1F80_1800, 1);
+    bus.write32(0x1F80_1803, 0x07); // ack the ReadN INT3
+}
+
 pub(crate) fn run_selftest() -> bool {
     println!("[CPU self-test]\n");
     let mut pass = true;
@@ -1167,16 +1202,14 @@ pub(crate) fn run_selftest() -> bool {
     }
 
     // --- the dot rate scales with horizontal resolution (640 is 2x 320) ----------------
+    // Halving the divider (8 -> 4) doubles the dot rate, so the same 56 cycles that gave 11 dots
+    // in the divider-8 case just above give exactly 22 here.
     {
-        let mut a = Bus::new();
-        a.gpu.gp1(0x0800_0003); // hres 640 -> divider 4
-        a.write32(0x1F80_1104, 0x0100);
-        a.tick(56); // 56*11 / (7*4) = 22
-        let mut b = Bus::new();
-        b.gpu.gp1(0x0800_0001); // hres 320 -> divider 8
-        b.write32(0x1F80_1104, 0x0100);
-        b.tick(56); // 11
-        check(&mut pass, "dot rate scales with resolution", a.read32(0x1F80_1100), b.read32(0x1F80_1100) * 2);
+        let mut bus = Bus::new();
+        bus.gpu.gp1(0x0800_0003); // hres 640 -> divider 4
+        bus.write32(0x1F80_1104, 0x0100);
+        bus.tick(56); // 56*11 / (7*4) = 22
+        check(&mut pass, "dot rate scales with resolution", bus.read32(0x1F80_1100), 22);
     }
 
     // --- TIMER1 hblank advances one tick per scanline ---------------------------------
@@ -1245,6 +1278,251 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "timer0 mode3 runs after first hblank", (c > 0) as u32, 1);
         bus.tick(200); // thereafter free-runs at the sysclock rate
         check(&mut pass, "timer0 mode3 free-runs", bus.read32(0x1F80_1100), c + 200);
+    }
+
+    // ===== CD-ROM drive ===========================================================
+    // The drive is a second processor: a command produces interrupts *later*, and the next interrupt
+    // is held until the host acknowledges the previous one (write IF). These tests drive that handshake
+    // directly. Registers: 0x1800 status/index, 0x1801 command/response, 0x1802 param/IE/data, 0x1803
+    // request/IF. The sequence is always: set index 0 -> push params -> write command -> tick -> read
+    // response + IF (at index 1) -> ack. `tick`s use round numbers past the (coarse) command delays.
+
+    // --- index select + idle FIFO-ready bits ------------------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1800, 0); // index 0
+        let s = bus.read32(0x1F80_1800);
+        check(&mut pass, "cd index 0 selected", s & 3, 0);
+        check(&mut pass, "cd param FIFO empty (bit3)", (s >> 3) & 1, 1);
+        check(&mut pass, "cd param FIFO ready (bit4)", (s >> 4) & 1, 1);
+        bus.write32(0x1F80_1800, 1); // index 1
+        check(&mut pass, "cd index 1 selected", bus.read32(0x1F80_1800) & 3, 1);
+    }
+
+    // --- pushing parameters clears PRMEMPT --------------------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1802, 0x11);
+        bus.write32(0x1F80_1802, 0x22);
+        check(&mut pass, "cd param FIFO not empty (bit3=0)", (bus.read32(0x1F80_1800) >> 3) & 1, 0);
+    }
+
+    // --- Test 0x20 returns the controller version ------------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1802, 0x20); // sub-function
+        bus.write32(0x1F80_1801, 0x19); // Test
+        bus.tick(60_000);
+        check(&mut pass, "cd response ready (bit5)", (bus.read32(0x1F80_1800) >> 5) & 1, 1);
+        bus.write32(0x1F80_1800, 1);
+        check(&mut pass, "cd Test IF = INT3", bus.read32(0x1F80_1803) & 7, 3);
+        check(&mut pass, "cd Test ver[0]", bus.read32(0x1F80_1801) & 0xFF, 0x94);
+        bus.read32(0x1F80_1801); // 0x09
+        bus.read32(0x1F80_1801); // 0x19
+        check(&mut pass, "cd Test ver[3]", bus.read32(0x1F80_1801) & 0xFF, 0xC0);
+    }
+
+    // --- Getstat returns the idle status byte -----------------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x01); // Getstat
+        bus.tick(60_000);
+        check(&mut pass, "cd Getstat status 0x02", bus.read32(0x1F80_1801) & 0xFF, 0x02);
+    }
+
+    // --- GetID two-phase: INT3, held until ack, then INT2 with the 'SCEA' region (the key case) ---
+    {
+        let mut bus = Bus::new();
+        bus.cdrom.load_disc(synth_disc());
+        bus.write32(0x1F80_1074, 0x0000_FFFF); // unmask all I_STAT sources
+        bus.write32(0x1F80_1800, 1);
+        bus.write32(0x1F80_1802, 0x1F); // IE = enable all CD interrupts (0x1802@idx1)
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x1A); // GetID
+        bus.tick(60_000); // phase A: INT3
+        check(&mut pass, "cd GetID INT3 raises I_STAT bit2", (bus.read32(0x1F80_1070) >> 2) & 1, 1);
+        bus.write32(0x1F80_1800, 1);
+        check(&mut pass, "cd GetID phase A = INT3", bus.read32(0x1F80_1803) & 7, 3);
+        check(&mut pass, "cd GetID status byte", bus.read32(0x1F80_1801) & 0xFF, 0x02);
+        bus.tick(60_000); // INT2 must NOT arrive un-acked
+        check(&mut pass, "cd GetID INT2 held until ack", bus.read32(0x1F80_1803) & 7, 3);
+        bus.write32(0x1F80_1070, 0); // clear I_STAT
+        bus.write32(0x1F80_1803, 0x07); // ack INT3
+        bus.tick(60_000); // phase B: INT2
+        check(&mut pass, "cd GetID phase B = INT2", bus.read32(0x1F80_1803) & 7, 2);
+        // (the bit-2 I_STAT raise is already pinned by phase A above and the IE-gating case below)
+        bus.read32(0x1F80_1801); // status
+        bus.read32(0x1F80_1801); // flags
+        bus.read32(0x1F80_1801); // disc type
+        bus.read32(0x1F80_1801); // 0x00
+        check(&mut pass, "cd GetID region 'S'", bus.read32(0x1F80_1801) & 0xFF, b'S' as u32);
+        check(&mut pass, "cd GetID region 'C'", bus.read32(0x1F80_1801) & 0xFF, b'C' as u32);
+        check(&mut pass, "cd GetID region 'E'", bus.read32(0x1F80_1801) & 0xFF, b'E' as u32);
+        check(&mut pass, "cd GetID region 'A'", bus.read32(0x1F80_1801) & 0xFF, b'A' as u32);
+    }
+
+    // --- IE gates the CPU line: IF still latches, but I_STAT bit2 stays low ------------
+    {
+        let mut bus = Bus::new();
+        bus.cdrom.load_disc(synth_disc());
+        bus.write32(0x1F80_1074, 0x0000_FFFF); // I_MASK open; IE stays 0
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x1A); // GetID
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        check(&mut pass, "cd IF latches with IE=0", bus.read32(0x1F80_1803) & 7, 3);
+        check(&mut pass, "cd IE=0 gates I_STAT bit2", (bus.read32(0x1F80_1070) >> 2) & 1, 0);
+    }
+
+    // --- no disc: GetID errors with INT5 ----------------------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x1A); // GetID, no disc
+        bus.tick(60_000); // INT3
+        bus.write32(0x1F80_1800, 1);
+        bus.write32(0x1F80_1803, 0x07); // ack INT3
+        bus.tick(60_000); // INT5
+        check(&mut pass, "cd no-disc GetID -> INT5", bus.read32(0x1F80_1803) & 7, 5);
+    }
+
+    // --- Setloc then SeekL: two-phase, INT2 only after the seek latency ----------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1802, 0x00); // MM
+        bus.write32(0x1F80_1802, 0x02); // SS
+        bus.write32(0x1F80_1802, 0x00); // FF -> LBA 0
+        bus.write32(0x1F80_1801, 0x02); // Setloc
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        bus.write32(0x1F80_1803, 0x07); // ack
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x15); // SeekL
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        check(&mut pass, "cd SeekL INT3 status seeking", bus.read32(0x1F80_1801) & 0xFF, 0x42);
+        check(&mut pass, "cd SeekL phase A = INT3", bus.read32(0x1F80_1803) & 7, 3);
+        bus.write32(0x1F80_1803, 0x07); // ack
+        bus.tick(500_000); // < SEEK_DELAY
+        check(&mut pass, "cd SeekL INT2 not before seek delay", bus.read32(0x1F80_1803) & 7, 0);
+        bus.tick(600_000); // past the seek delay
+        check(&mut pass, "cd SeekL phase B = INT2", bus.read32(0x1F80_1803) & 7, 2);
+    }
+
+    // --- Setmode stores the double-speed flag -----------------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1802, 0x80); // double speed
+        bus.write32(0x1F80_1801, 0x0E); // Setmode
+        bus.tick(60_000);
+        check(&mut pass, "cd Setmode stored", bus.cdrom.debug_mode() as u32, 0x80);
+    }
+
+    // --- ReadN streams INT1 sectors; Request copies the user data to the data FIFO -----
+    {
+        let mut bus = Bus::new();
+        bus.cdrom.load_disc(synth_disc());
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1802, 0x00);
+        bus.write32(0x1F80_1802, 0x02);
+        bus.write32(0x1F80_1802, 0x00); // Setloc LBA 0
+        bus.write32(0x1F80_1801, 0x02);
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        bus.write32(0x1F80_1803, 0x07); // ack Setloc
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x06); // ReadN
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        check(&mut pass, "cd ReadN INT3 ack", bus.read32(0x1F80_1803) & 7, 3);
+        bus.write32(0x1F80_1803, 0x07); // ack INT3
+        bus.tick(500_000); // < SEEK_DELAY
+        check(&mut pass, "cd ReadN no sector before seek", bus.read32(0x1F80_1803) & 7, 0);
+        bus.tick(600_000); // first sector
+        check(&mut pass, "cd ReadN INT1 sector ready", bus.read32(0x1F80_1803) & 7, 1);
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1803, 0x80); // Request want-data
+        check(&mut pass, "cd data FIFO ready (bit6)", (bus.read32(0x1F80_1800) >> 6) & 1, 1);
+        check(&mut pass, "cd sector 0 data byte", bus.read32(0x1F80_1802) & 0xFF, 0xA0);
+        bus.write32(0x1F80_1800, 1);
+        bus.write32(0x1F80_1803, 0x07); // ack INT1
+        bus.tick(451_585); // one sector period -> next INT1
+        check(&mut pass, "cd ReadN streams next sector", bus.read32(0x1F80_1803) & 7, 1);
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1803, 0x80); // Request sector 1
+        check(&mut pass, "cd sector 1 data byte", bus.read32(0x1F80_1802) & 0xFF, 0xA1);
+    }
+
+    // --- a sector pulled into RAM via DMA channel 3 -----------------------------------
+    {
+        let mut bus = Bus::new();
+        cd_begin_read(&mut bus); // Setloc LBA 0 -> ReadN -> INT3 acked
+        bus.tick(1_100_000); // first sector loaded
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1803, 0x80); // fill data FIFO with sector 0 (2048 bytes of 0xA0)
+        // DMA channel 3: device -> RAM. MADR 0x1F8010B0, BCR 0x1F8010B4, CHCR 0x1F8010B8.
+        bus.write32(0x1F80_10F0, bus.read32(0x1F80_10F0) | (1 << 15)); // enable ch3 (DPCR bit 15)
+        bus.write32(0x1F80_10B0, 0x0000_3000); // MADR = 0x3000
+        bus.write32(0x1F80_10B4, (1 << 16) | 0x200); // BCR = 1 block x 512 words = 2048 bytes
+        bus.write32(0x1F80_10B8, 0x0100_0200); // CHCR = start | sync 1 | device->RAM
+        check(&mut pass, "cd DMA ch3 sector -> RAM", bus.read32(0x0000_3000), 0xA0A0_A0A0);
+    }
+
+    // --- MSF <-> LBA conversion (BCD, with the 150-frame pregap) -----------------------
+    {
+        use crate::cdrom::{lba_to_msf_bcd, msf_bcd_to_lba};
+        check(&mut pass, "cd MSF->LBA 00:02:00", msf_bcd_to_lba(0x00, 0x02, 0x00), 0);
+        check(&mut pass, "cd MSF->LBA 00:02:74", msf_bcd_to_lba(0x00, 0x02, 0x74), 74);
+        check(&mut pass, "cd MSF->LBA 00:03:00", msf_bcd_to_lba(0x00, 0x03, 0x00), 75);
+        let (m, s, f) = lba_to_msf_bcd(75);
+        let packed = ((m as u32) << 16) | ((s as u32) << 8) | f as u32;
+        check(&mut pass, "cd LBA->MSF 75 round-trip", packed, 0x00_0300);
+    }
+
+    // --- Init: two-phase, and it resets the mode --------------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1802, 0x80); // set double speed first
+        bus.write32(0x1F80_1801, 0x0E); // Setmode
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        bus.write32(0x1F80_1803, 0x07);
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x0A); // Init
+        bus.tick(80_000); // > INIT_ACK
+        bus.write32(0x1F80_1800, 1);
+        check(&mut pass, "cd Init INT3", bus.read32(0x1F80_1803) & 7, 3);
+        bus.write32(0x1F80_1803, 0x07); // ack
+        bus.tick(100_000); // < INIT_DONE
+        check(&mut pass, "cd Init INT2 not yet", bus.read32(0x1F80_1803) & 7, 0);
+        bus.tick(500_000); // past INIT_DONE
+        check(&mut pass, "cd Init INT2 complete", bus.read32(0x1F80_1803) & 7, 2);
+        check(&mut pass, "cd Init reset mode", bus.cdrom.debug_mode() as u32, 0);
+    }
+
+    // --- Pause stops the streaming read -----------------------------------------------
+    {
+        let mut bus = Bus::new();
+        cd_begin_read(&mut bus); // Setloc LBA 0 -> ReadN -> INT3 acked
+        bus.tick(1_100_000); // first INT1
+        bus.write32(0x1F80_1803, 0x07); // ack INT1
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x09); // Pause
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        check(&mut pass, "cd Pause INT3", bus.read32(0x1F80_1803) & 7, 3);
+        bus.write32(0x1F80_1803, 0x07); // ack
+        bus.tick(60_000);
+        check(&mut pass, "cd Pause INT2", bus.read32(0x1F80_1803) & 7, 2);
+        bus.write32(0x1F80_1803, 0x07); // ack
+        bus.tick(1_000_000); // longer than a sector period
+        check(&mut pass, "cd Pause stopped the stream", bus.read32(0x1F80_1803) & 7, 0);
     }
 
     println!(
