@@ -20,13 +20,16 @@
 //!   * TIMER1: system clock, or the GPU **hblank** (one tick per scanline)
 //!   * TIMER2: system clock, or **system clock / 8**
 //!
-//! This stage implements the register model and the system-clock sources fully; the two
-//! GPU-derived sources (dotclock, hblank) and the *sync modes* (pausing/resetting around
-//! h/v-blank) need per-scanline timing the GPU doesn't expose yet, so they route through a single
-//! `external_ticks` seam that currently contributes nothing — wired but inert, completed later.
+//! The GPU-derived sources (dot clock, hblank) and the blanking signals the sync modes gate on come
+//! in through the `VideoTiming` the GPU returns each `bus.tick` (see `gpu.rs`); the bus threads it
+//! to `Timers::tick`. The **sync modes** (mode bits 0-2) pause or reset a counter around the
+//! horizontal/vertical blank — TIMER0 syncs to hblank, TIMER1 to vblank, and TIMER2's two bits only
+//! choose stop vs free-run (`apply_sync`/`gate_blank`). Their exact counts are approximate under our
+//! coarse cycle model; the *shapes* (pause = flat, reset = sawtooth, stop = 0) are what they pin.
 
 use std::cell::Cell;
 
+use crate::gpu::VideoTiming;
 use crate::irq::source;
 
 /// One root counter. The three differ only in how mode bits 8-9 decode (the `n` field branches
@@ -69,6 +72,11 @@ struct Timer {
     /// chunk sizes from `bus.tick`, so the leftover (0..7) after dividing by 8 must **carry** into the
     /// next call or the /8 rate drifts.
     div8_acc: u8,
+
+    /// Sync-mode-3 latch. Modes 0-2 re-decide every step, but mode 3 ("pause until the FIRST blank
+    /// event, then free-run forever") needs one bit of memory: has that first hblank/vblank arrived
+    /// since the last mode write? Reset on a mode write (re-arms the wait). Unused by TIMER2.
+    sync_started: bool,
 }
 
 impl Timer {
@@ -86,33 +94,84 @@ impl Timer {
             irq_flag: true,
             irq_fired: false,
             div8_acc: 0,
+            sync_started: false,
         }
     }
 
-    /// Convert `cycles` system-clock cycles into the number of ticks **this** counter's selected
-    /// source produces, then advance by that many. Returns whether an enabled IRQ condition fired.
-    fn advance(&mut self, cycles: u32) -> bool {
-        // Mode bits 8-9 select the source; the meaning differs per counter (see the module header).
+    /// Advance this counter for one `bus.tick`. First pick the **raw** number of source ticks (the
+    /// selected clock produced), then run it through the sync gate (which may pause the count or reset
+    /// the counter around h/v-blank), then step. `v` carries the GPU's per-step video timing. Returns
+    /// whether an enabled IRQ condition fired.
+    fn advance(&mut self, cycles: u32, v: &VideoTiming) -> bool {
+        // Mode bits 8-9 select the clock source; the meaning differs per counter (see the module head).
         let src = (self.mode >> 8) & 3;
-        let ticks = match self.n {
-            // TIMER0: src 0/2 = system clock, 1/3 = dot clock (deferred -> external seam).
-            0 => if src & 1 == 0 { cycles } else { self.external_ticks(cycles) },
-            // TIMER1: src 0/2 = system clock, 1/3 = hblank (deferred -> external seam).
-            1 => if src & 1 == 0 { cycles } else { self.external_ticks(cycles) },
+        let raw = match self.n {
+            // TIMER0: src 0/2 = system clock, 1/3 = the GPU dot clock.
+            0 => if src & 1 == 0 { cycles } else { v.dotclocks },
+            // TIMER1: src 0/2 = system clock, 1/3 = hblank (one tick per scanline).
+            1 => if src & 1 == 0 { cycles } else { v.hblanks },
             // TIMER2: src 0/1 = system clock, 2/3 = system clock / 8.
             2 => if src < 2 { cycles } else { self.div8(cycles) },
             _ => 0,
         };
+        let ticks = self.apply_sync(raw, v);
         self.step(ticks)
     }
 
-    /// The GPU-derived sources (TIMER0 dot clock, TIMER1 hblank). They tick at rates only the GPU's
-    /// per-scanline timing knows, which isn't modelled yet — so for now a counter programmed for one
-    /// of these simply doesn't advance. This is the single seam to fill when that timing lands: return
-    /// the number of dotclocks / hblanks elapsed in `cycles`. Until then it's deliberately inert (the
-    /// self-test pins that, so filling it in is a visible change).
-    fn external_ticks(&mut self, _cycles: u32) -> u32 {
-        0
+    /// Apply the sync gate. Mode bit 0 enables sync; bits 1-2 pick the mode. When disabled the counter
+    /// free-runs (the raw ticks pass straight through). The behaviour differs per counter: TIMER0
+    /// syncs to **hblank**, TIMER1 to **vblank**, and TIMER2 only "stops" or "free-runs". Returns the
+    /// number of ticks to actually advance this step (0 = paused), after any reset-to-0 the mode calls
+    /// for.
+    fn apply_sync(&mut self, raw: u32, v: &VideoTiming) -> u32 {
+        if self.mode & 1 == 0 {
+            return raw; // sync disabled -> free-run, bits 1-2 ignored
+        }
+        let sync = (self.mode >> 1) & 3;
+        match self.n {
+            0 => self.gate_blank(raw, sync, v.in_hblank, v.hblank_edge), // syncs to hblank
+            1 => self.gate_blank(raw, sync, v.in_vblank, v.vblank_edge), // syncs to vblank
+            // TIMER2's two sync bits only choose stop vs free-run — and the polarity is INVERTED from
+            // TIMER0/1: modes 0 and 3 *stop* the counter dead, 1 and 2 *free-run* (sync has no effect).
+            2 => if sync == 0 || sync == 3 { 0 } else { raw },
+            _ => 0,
+        }
+    }
+
+    /// The shared TIMER0/TIMER1 hblank/vblank sync gate — the four modes from psx-spx. `blank` is the
+    /// beam's in-blank level at the end of the step; `edge` is whether a blank period *started* during
+    /// it. Reset modes use the edge; pause modes use the level (see the "counts vs flags" note on
+    /// `VideoTiming`).
+    fn gate_blank(&mut self, raw: u32, sync: u16, blank: bool, edge: bool) -> u32 {
+        match sync {
+            // 0: pause *during* blank, count the rest of the time.
+            0 => if blank { 0 } else { raw },
+            // 1: reset the counter to 0 at each blank start; otherwise count freely.
+            1 => {
+                if edge {
+                    self.value = 0;
+                }
+                raw
+            }
+            // 2: reset at the blank start AND only count *while* in blank (paused outside it).
+            2 => {
+                if edge {
+                    self.value = 0;
+                }
+                if blank { raw } else { 0 }
+            }
+            // 3: stay paused until the first blank occurs, then free-run forever.
+            _ => {
+                if !self.sync_started {
+                    if edge {
+                        self.sync_started = true;
+                    } else {
+                        return 0; // still waiting for the first blank
+                    }
+                }
+                raw
+            }
+        }
     }
 
     /// System-clock/8 prescaler: divide incoming cycles by 8, carrying the remainder across calls.
@@ -193,13 +252,13 @@ impl Timers {
         Self { ch: [Timer::new(0), Timer::new(1), Timer::new(2)] }
     }
 
-    /// Advance all three counters by `cycles` system-clock cycles (the catch-up seam, called from
-    /// `bus.tick`). Returns a 3-bit mask of which timers fired an IRQ this step (bit n => TIMERn); the
-    /// bus raises the matching I_STAT sources.
-    pub fn tick(&mut self, cycles: u32) -> u8 {
+    /// Advance all three counters by one `bus.tick` (`cycles` system-clock cycles, plus the GPU video
+    /// timing `v` that feeds the dot-clock/hblank sources and the sync gates). Returns a 3-bit mask of
+    /// which timers fired an IRQ this step (bit n => TIMERn); the bus raises the matching I_STAT sources.
+    pub fn tick(&mut self, cycles: u32, v: &VideoTiming) -> u8 {
         let mut fired = 0u8;
         for n in 0..3 {
-            if self.ch[n].advance(cycles) {
+            if self.ch[n].advance(cycles, v) {
                 fired |= 1 << n;
             }
         }
@@ -251,6 +310,7 @@ impl Timers {
                 t.reached_target.set(false); // clear the status latches
                 t.reached_max.set(false);
                 t.div8_acc = 0; // restart the /8 prescaler cleanly
+                t.sync_started = false; // re-arm sync mode 3's "wait for first blank"
             }
             0x8 => t.target = val as u16,
             _ => {}

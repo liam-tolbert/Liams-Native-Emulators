@@ -112,18 +112,22 @@ impl Bus {
     }
 
     /// Advance the time-based subsystems by `cycles` CPU cycles (the "catch-up" seam, called from
-    /// `cpu.step` after every instruction — exactly the DMG shape). The GPU keeps the video clock; when
-    /// it crosses a frame boundary it asks for the **VBlank** interrupt, which the BIOS/games service to
-    /// run their per-frame loop. (Root counters/timers will hang off here too, later.)
+    /// `cpu.step` after every instruction — exactly the DMG shape). The GPU keeps the video clock and
+    /// reports back a `VideoTiming` for the step: its VBlank-start edge becomes the **VBlank**
+    /// interrupt the BIOS/games service per frame, and its dot-clock/hblank/blanking signals feed the
+    /// root counters, whose own target/wrap interrupts are raised here too.
     pub fn tick(&mut self, cycles: u32) {
-        if self.gpu.tick(cycles) {
+        // Advance the video clock first and capture the timing it produced: the timers' GPU-derived
+        // sources (TIMER0 dot clock, TIMER1 hblank) and their h/v-blank sync gates both read it.
+        let v = self.gpu.tick(cycles);
+        if v.vblank_edge {
             self.irq.raise(crate::irq::source::VBLANK);
         }
-        // The root counters share the same system-clock catch-up. Each one that crosses an enabled
-        // IRQ boundary comes back in the fired-mask; we raise its I_STAT source here on the bus —
-        // only the bus owns both the timers and the interrupt controller, the same reason `run_dma`
-        // raises the DMA IRQ here rather than inside the device.
-        let fired = self.timers.tick(cycles);
+        // The root counters share the same catch-up, now fed that video timing. Each one that crosses
+        // an enabled IRQ boundary comes back in the fired-mask; we raise its I_STAT source here on the
+        // bus — only the bus owns both the timers and the interrupt controller, the same reason
+        // `run_dma` raises the DMA IRQ here rather than inside the device.
+        let fired = self.timers.tick(cycles, &v);
         for n in 0..3u8 {
             if fired & (1 << n) != 0 {
                 self.irq.raise(Timers::irq_source(n));

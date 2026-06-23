@@ -1015,22 +1015,23 @@ pub(crate) fn run_selftest() -> bool {
 
     // ===== display timing (VBlank) ================================================
     // Drive the bus's catch-up `tick` directly (no CPU) and watch the GPU trip a frame: VBlank should
-    // hit `I_STAT` bit 0 exactly when the cycle accumulator crosses CPU_CYCLES_PER_FRAME, the
-    // `frame_ready` flag should latch (and clear on read), and GPUSTAT bit 31 (the interlace field)
-    // should toggle once per frame.
+    // hit `I_STAT` bit 0 exactly when the beam crosses into the vertical blank (line 240, i.e.
+    // NTSC_VBLANK_START), the `frame_ready` flag should latch (and clear on read), and GPUSTAT bit 31
+    // (the interlace field) should toggle once per frame. (The scanline machine makes this the
+    // vblank-start edge, not the whole-frame boundary — the visible image is complete at that point.)
     {
         let mut bus = Bus::new();
         bus.write32(0x1F80_1074, 0x0000_FFFF); // I_MASK: allow all sources (incl. VBlank, bit 0)
         let field_before = (bus.gpu.status() >> 31) & 1;
 
-        // One cycle short of a frame: no VBlank, no frame yet.
-        bus.tick(gpu::CPU_CYCLES_PER_FRAME - 1);
-        check(&mut pass, "no VBlank before frame boundary", (bus.read32(0x1F80_1070) >> 0) & 1, 0);
-        check(&mut pass, "no frame before boundary", bus.gpu.take_frame() as u32, 0);
+        // One cycle short of the vblank-start edge: no VBlank, no frame yet.
+        bus.tick(gpu::NTSC_VBLANK_START - 1);
+        check(&mut pass, "no VBlank before vblank start", (bus.read32(0x1F80_1070) >> 0) & 1, 0);
+        check(&mut pass, "no frame before vblank start", bus.gpu.take_frame() as u32, 0);
 
-        // Crossing the boundary raises VBlank, latches the frame, and flips the field.
+        // Crossing into the vblank raises VBlank, latches the frame, and flips the field.
         bus.tick(2);
-        check(&mut pass, "VBlank raised at frame boundary", bus.read32(0x1F80_1070) & 1, 1);
+        check(&mut pass, "VBlank raised at vblank start", bus.read32(0x1F80_1070) & 1, 1);
         let field_after = (bus.gpu.status() >> 31) & 1;
         check(&mut pass, "GPUSTAT field bit toggled", field_before ^ field_after, 1);
         check(&mut pass, "frame_ready latched", bus.gpu.take_frame() as u32, 1);
@@ -1150,12 +1151,100 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "repeat IRQ fires again after reset", (bus.read32(0x1F80_1070) >> 5) & 1, 1);
     }
 
-    // --- a GPU-derived source is inert until M4.5b (locks the deferral) ----------------
+    // ===== timer GPU clock sources + sync modes ===================================
+    // These exercise the seam M4.5b fills: TIMER0's dot clock and TIMER1's hblank now advance from the
+    // GPU's scanline/dot machine, and the sync modes pause/reset the counters around h/v-blank. Set the
+    // resolution/video-mode with GP1(08) first where the dot rate matters; `gpu::CYCLES_PER_SCANLINE`
+    // and `gpu::NTSC_VBLANK_START` are the scanline/vblank boundaries.
+
+    // --- TIMER0 dot clock advances at the resolution-derived rate ----------------------
     {
         let mut bus = Bus::new();
-        bus.write32(0x1F80_1104, 0x0100); // T0 mode: clock source = dot clock (bits 8-9 = 1)
-        bus.tick(1000);
-        check(&mut pass, "dotclock source inert (no GPU timing yet)", bus.read32(0x1F80_1100), 0);
+        bus.gpu.gp1(0x0800_0001); // GP1(08): hres 320 -> dot divider 8, NTSC
+        bus.write32(0x1F80_1104, 0x0100); // T0 mode: source = dot clock (bits 8-9 = 1)
+        bus.tick(56); // 56*11 / (7*8) = 11 dots exactly
+        check(&mut pass, "timer0 dot clock advances", bus.read32(0x1F80_1100), 11);
+    }
+
+    // --- the dot rate scales with horizontal resolution (640 is 2x 320) ----------------
+    {
+        let mut a = Bus::new();
+        a.gpu.gp1(0x0800_0003); // hres 640 -> divider 4
+        a.write32(0x1F80_1104, 0x0100);
+        a.tick(56); // 56*11 / (7*4) = 22
+        let mut b = Bus::new();
+        b.gpu.gp1(0x0800_0001); // hres 320 -> divider 8
+        b.write32(0x1F80_1104, 0x0100);
+        b.tick(56); // 11
+        check(&mut pass, "dot rate scales with resolution", a.read32(0x1F80_1100), b.read32(0x1F80_1100) * 2);
+    }
+
+    // --- TIMER1 hblank advances one tick per scanline ---------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1114, 0x0100); // T1 mode: source = hblank (bits 8-9 = 1)
+        bus.tick(gpu::CYCLES_PER_SCANLINE * 10 + 5); // cross 10 scanline boundaries in one step
+        check(&mut pass, "timer1 hblank advances per scanline", bus.read32(0x1F80_1110), 10);
+    }
+
+    // --- TIMER2 sync stop vs free-run (its two sync bits only choose those) ------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1124, 0x0001); // sync enable + mode 0 -> STOP
+        bus.tick(500);
+        check(&mut pass, "timer2 sync stop (mode 0)", bus.read32(0x1F80_1120), 0);
+        let mut b1 = Bus::new();
+        b1.write32(0x1F80_1124, 0x0003); // sync enable + mode 1 -> free-run
+        b1.tick(500);
+        check(&mut pass, "timer2 sync free-run (mode 1)", b1.read32(0x1F80_1120), 500);
+        let mut b3 = Bus::new();
+        b3.write32(0x1F80_1124, 0x0007); // sync enable + mode 3 -> STOP
+        b3.tick(500);
+        check(&mut pass, "timer2 sync stop (mode 3)", b3.read32(0x1F80_1120), 0);
+    }
+
+    // --- TIMER0 reset-at-hblank (sync mode 1) -----------------------------------------
+    // Count up within a scanline, then cross the hblank: the counter zeroes and counts the rest.
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1104, 0x0003); // T0: sync enable + mode 1, sysclock source
+        bus.tick(gpu::CYCLES_PER_SCANLINE - 100); // no hblank crossed yet -> counts up
+        check(&mut pass, "timer0 pre-hblank counts up", bus.read32(0x1F80_1100), gpu::CYCLES_PER_SCANLINE - 100);
+        bus.tick(100); // crosses the hblank -> reset to 0, then counts the 100
+        check(&mut pass, "timer0 reset-at-hblank", bus.read32(0x1F80_1100), 100);
+    }
+
+    // --- TIMER1 reset-at-vblank, and pause-during-vblank ------------------------------
+    {
+        // reset-at-vblank (mode 1): cross the vblank start and the counter zeroes + counts the rest.
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1114, 0x0003); // T1: sync enable + mode 1, sysclock source
+        bus.tick(gpu::NTSC_VBLANK_START - 100); // up to just before vblank (no reset yet)
+        bus.tick(100); // crosses vblank start -> reset, then +100
+        check(&mut pass, "timer1 reset-at-vblank", bus.read32(0x1F80_1110), 100);
+    }
+    {
+        // pause-during-vblank (mode 0): a step that ends in the vblank region doesn't count.
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1114, 0x0001); // T1: sync enable + mode 0, sysclock source
+        bus.tick(gpu::CYCLES_PER_SCANLINE * 239 + 100); // last visible scanline -> counter counted
+        let before = bus.read32(0x1F80_1110);
+        check(&mut pass, "timer1 counted during visible lines", (before > 0) as u32, 1);
+        bus.tick(gpu::CYCLES_PER_SCANLINE); // crosses into vblank, ends there -> paused
+        check(&mut pass, "timer1 pause-during-vblank holds", bus.read32(0x1F80_1110), before);
+    }
+
+    // --- sync mode 3: pause until the first blank event, then free-run -----------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1104, 0x0007); // T0: sync enable + mode 3, sysclock source
+        bus.tick(gpu::CYCLES_PER_SCANLINE - 50); // no hblank yet -> still paused
+        check(&mut pass, "timer0 mode3 paused before first hblank", bus.read32(0x1F80_1100), 0);
+        bus.tick(100); // first hblank -> starts running
+        let c = bus.read32(0x1F80_1100);
+        check(&mut pass, "timer0 mode3 runs after first hblank", (c > 0) as u32, 1);
+        bus.tick(200); // thereafter free-runs at the sysclock rate
+        check(&mut pass, "timer0 mode3 free-runs", bus.read32(0x1F80_1100), c + 200);
     }
 
     println!(

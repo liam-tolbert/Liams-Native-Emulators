@@ -48,11 +48,71 @@ use std::cell::Cell;
 const VRAM_W: usize = 1024;
 const VRAM_H: usize = 512;
 
-/// CPU cycles per video frame: the ~33.8688 MHz R3000 clock / ~60 Hz NTSC ≈ 564,480. **Approximate
-/// by design** — our per-instruction cycle model is coarse, and the host window paces to a real-time
-/// 60 Hz anyway, so this only sets *how many instructions run between VBlanks*, not the wall-clock
-/// rate. Exposed `pub(crate)` so the self-test can pin the boundary without hard-coding it twice.
-pub(crate) const CPU_CYCLES_PER_FRAME: u32 = 564_480;
+// ===== video timing =====================================================================
+// The GPU keeps the machine's sense of time. We model it at **scanline granularity**: the video beam
+// sweeps a fixed number of scanlines per frame, the last few of which are the vertical blank, and each
+// scanline is a fixed number of CPU cycles. From that one state machine fall out everything the rest of
+// the machine needs: the VBlank interrupt, the interlace field, the host's "frame done" signal, and —
+// new in this stage — the two timer clock sources (TIMER0's dot clock, TIMER1's hblank) and the
+// blanking signals the timer sync modes gate on.
+
+/// GPU clock : CPU clock = 53.2224 MHz : 33.8688 MHz = exactly **11/7**. The dot clock is this GPU
+/// clock divided by a resolution-dependent divider (`dotclock_divider`). We keep the ratio as the
+/// integer pair (11, 7) and accumulate dots *rationally* (see `tick`) so the rate stays exact — a
+/// float `11.0/7.0/divider` drifts a fraction of a dot every step and TIMER0 would slowly lose sync.
+const GPU_CLK_NUM: u32 = 11;
+const GPU_CLK_DEN: u32 = 7;
+
+/// Total and visible scanlines per frame, per video standard (Nocash psx-spx). The vertical blank is
+/// the lines past `visible` up to `total`. (display_mode bit 3 selects NTSC vs PAL.)
+const NTSC_LINES: u16 = 263;
+const NTSC_VISIBLE: u16 = 240;
+const PAL_LINES: u16 = 314;
+const PAL_VISIBLE: u16 = 288;
+
+/// CPU cycles per scanline (NTSC: ≈ 564,480 / 263 ≈ 2146). We DERIVE the per-frame budget from this
+/// (`lines * CYCLES_PER_SCANLINE`) rather than the other way round, so a whole number of scanlines
+/// tiles a frame exactly and `line_acc` never carries a fractional remainder across the frame wrap —
+/// which is what keeps the VBlank boundary (and the self-test's exact `-1 / +2` probe) stable.
+/// `pub(crate)` so the self-test can drive whole-scanline steps without hard-coding the number.
+pub(crate) const CYCLES_PER_SCANLINE: u32 = 2146;
+
+/// Representative horizontal-blank width, in CPU cycles at the tail of each scanline. The active
+/// (drawing) part is `CYCLES_PER_SCANLINE - HBLANK_CYCLES`; `in_hblank` is true while the beam sits in
+/// the tail. The exact width is unobservable under our coarse cycle model — this only positions
+/// TIMER0's hblank *sync window*, it never counts hblanks (those are whole-scanline boundaries).
+const HBLANK_CYCLES: u32 = 270;
+
+/// CPU cycles in a whole NTSC frame (263 scanlines). Kept under the old name so the self-test's
+/// symbolic use still resolves; `tick` itself derives the geometry live (so PAL works too).
+pub(crate) const CPU_CYCLES_PER_FRAME: u32 = NTSC_LINES as u32 * CYCLES_PER_SCANLINE;
+
+/// CPU cycle at which an NTSC frame enters the vertical blank (line 240) — i.e. when the VBlank edge
+/// fires. Exposed so the self-test can pin that boundary without hard-coding it twice.
+pub(crate) const NTSC_VBLANK_START: u32 = NTSC_VISIBLE as u32 * CYCLES_PER_SCANLINE;
+
+/// What one `tick` produced, for the bus and the timers to consume. These are **counts and edges
+/// *within* the step**, not instantaneous flags: a single coarse `bus.tick(cycles)` can be thousands
+/// of cycles — several whole scanlines — so we tally each scanline boundary (`hblanks`) and note
+/// whether a blank-period *started* anywhere in the step (`*_edge`), rather than sampling the beam
+/// position once. The `in_*` levels report the beam at the *end* of the step (good enough for the
+/// level-sensitive pause gates; the edges drive the reset gates).
+#[derive(Clone, Copy, Default)]
+pub struct VideoTiming {
+    /// A VBlank-start edge occurred this step (entering line `visible`). The bus raises the VBlank
+    /// IRQ; TIMER1's vblank sync uses the same edge.
+    pub vblank_edge: bool,
+    /// At least one scanline-start (hblank) edge occurred this step — TIMER0's reset-at-hblank trigger.
+    pub hblank_edge: bool,
+    /// Dot clocks elapsed this step — TIMER0's dot-clock source.
+    pub dotclocks: u32,
+    /// Scanline-starts crossed this step — TIMER1's hblank source (one tick per scanline).
+    pub hblanks: u32,
+    /// Beam is in the horizontal-blank tail at the end of the step — TIMER0's pause/level gates.
+    pub in_hblank: bool,
+    /// Beam is in the vertical-blank region at the end of the step — TIMER1's pause/level gates.
+    pub in_vblank: bool,
+}
 
 pub struct Gpu {
     /// The 1 MiB of video RAM, row-major (`y * 1024 + x`). Heap-allocated as a `Vec` rather than a
@@ -136,14 +196,20 @@ pub struct Gpu {
     /// 15/24-bit colour, interlace, the "reverse" flag. Scattered into GPUSTAT bits 14 and 16-22.
     display_mode: u32,
 
-    // ===== display timing =========================================================
+    // ===== display timing — the scanline / dot state machine =====================
     // Free-running, the way real hardware keeps time: `tick` (called from `bus.tick` every CPU
-    // instruction) accumulates cycles and trips a VBlank once per frame. Deliberately *not* reset by
-    // GP1(00) — a GP-port command can't stop the video clock.
-    /// CPU cycles accumulated toward the next frame boundary.
-    cycle_acc: u32,
-    /// Set true at each frame boundary; the host window loop drains it (`take_frame`) to know when to
-    /// blit. The analog of the DMG PPU's `frame_ready`.
+    // instruction) walks the video beam scanline-by-scanline and trips a VBlank once per frame.
+    // Deliberately *not* reset by GP1(00) — a GP-port command can't stop the video clock.
+    /// Current scanline within the frame (0 .. lines_per_frame-1); the vertical blank is the lines at
+    /// or past `visible`.
+    scanline: u16,
+    /// CPU cycles accumulated into the *current* scanline (0 .. CYCLES_PER_SCANLINE).
+    line_acc: u32,
+    /// Rational dot-clock accumulator — holds `cycles * 11` not yet converted to whole dots; dividing
+    /// by `7 * divider` extracts dots and the remainder stays here, so the dot rate is exact.
+    dot_acc: u32,
+    /// Set true when the beam enters the vertical blank (visible image complete); the host window loop
+    /// drains it (`take_frame`) to know when to blit. The analog of the DMG PPU's `frame_ready`.
     frame_ready: bool,
     /// Interlace field flag, toggled once per frame → GPUSTAT bit 31 (the "drawing odd/even line").
     field_odd: bool,
@@ -210,7 +276,9 @@ impl Gpu {
             display_v1: 0,
             display_v2: 0,
             display_mode: 0,
-            cycle_acc: 0,
+            scanline: 0,
+            line_acc: 0,
+            dot_acc: 0,
             frame_ready: false,
             field_odd: false,
             gpuread: 0,
@@ -241,19 +309,44 @@ impl Gpu {
 
     // ===== display timing + readout ===============================================
 
-    /// Advance the video clock by `cycles` CPU cycles (called from `bus.tick`). Returns `true` once
-    /// per frame, on the cycle that crosses a frame boundary — the bus turns that into the VBlank IRQ.
-    /// We loop (not a single `if`) so an unusually long step can't swallow a boundary.
-    pub fn tick(&mut self, cycles: u32) -> bool {
-        self.cycle_acc += cycles;
-        let mut vblank = false;
-        while self.cycle_acc >= CPU_CYCLES_PER_FRAME {
-            self.cycle_acc -= CPU_CYCLES_PER_FRAME;
-            self.frame_ready = true;
-            self.field_odd = !self.field_odd; // GPUSTAT bit 31 — the interlace field flips per frame
-            vblank = true;
+    /// Advance the video clock by `cycles` CPU cycles (called from `bus.tick`) and return the
+    /// `VideoTiming` the bus and timers consume. The scanline walk is the heart: push `line_acc`
+    /// forward and, each time it fills a scanline, advance the beam one line (wrapping at the bottom →
+    /// a new frame). The VBlank-start edge — entering the first non-visible line — is when we raise the
+    /// VBlank IRQ, latch `frame_ready` (the visible image is complete), and flip the interlace field;
+    /// the frame *wrap* itself only resets the line counter. We loop (not a single `if`) because a
+    /// coarse step can be several scanlines long.
+    pub fn tick(&mut self, cycles: u32) -> VideoTiming {
+        let (total, visible) = self.frame_geometry();
+        let divider = self.dotclock_divider();
+
+        // Dot clock: exact rational accumulation. dots = (cycles*11) / (7*divider); keep the remainder.
+        self.dot_acc += cycles * GPU_CLK_NUM;
+        let dot_den = GPU_CLK_DEN * divider;
+        let dotclocks = self.dot_acc / dot_den;
+        self.dot_acc %= dot_den;
+
+        let mut v = VideoTiming { dotclocks, ..VideoTiming::default() };
+        self.line_acc += cycles;
+        while self.line_acc >= CYCLES_PER_SCANLINE {
+            self.line_acc -= CYCLES_PER_SCANLINE;
+            v.hblanks += 1; // one scanline boundary crossed = one hblank tick (TIMER1's source)
+            v.hblank_edge = true; // ... and TIMER0's reset-at-hblank trigger
+
+            let entering = self.scanline + 1;
+            self.scanline = if entering >= total { 0 } else { entering };
+            // VBlank starts the instant we cross from the last visible line into the blank region.
+            if entering == visible {
+                v.vblank_edge = true;
+                self.frame_ready = true;
+                self.field_odd = !self.field_odd; // GPUSTAT bit 31 — interlace field flips per frame
+            }
         }
-        vblank
+
+        // End-of-step beam position, for the level-sensitive sync gates.
+        v.in_vblank = self.scanline >= visible;
+        v.in_hblank = self.line_acc >= CYCLES_PER_SCANLINE - HBLANK_CYCLES;
+        v
     }
 
     /// Read-and-clear the "a frame just finished" flag. The host window loop calls this to decide when
@@ -281,6 +374,29 @@ impl Gpu {
         };
         let h = if (dm >> 2) & 1 != 0 { 480 } else { 240 };
         (w, h)
+    }
+
+    /// The dot-clock divider for the current horizontal resolution (psx-spx): 256→10, 320→8, 368→7,
+    /// 512→5, 640→4. The dot clock is the GPU clock divided by this. Reuses `display_resolution`'s
+    /// width decode so the two can never disagree.
+    fn dotclock_divider(&self) -> u32 {
+        match self.display_resolution().0 {
+            256 => 10,
+            320 => 8,
+            368 => 7,
+            512 => 5,
+            _ => 4, // 640
+        }
+    }
+
+    /// Total and visible scanlines for the current video standard (display_mode bit 3: 0 = NTSC,
+    /// 1 = PAL). Drives where the vertical blank begins and when a frame wraps.
+    fn frame_geometry(&self) -> (u16, u16) {
+        if (self.display_mode >> 3) & 1 != 0 {
+            (PAL_LINES, PAL_VISIBLE)
+        } else {
+            (NTSC_LINES, NTSC_VISIBLE)
+        }
     }
 
     /// Snapshot the on-screen image as `(width, height, pixels)` where each pixel is `0x00RRGGBB` for
