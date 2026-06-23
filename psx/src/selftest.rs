@@ -230,8 +230,10 @@ pub(crate) fn run_selftest() -> bool {
 
     // --- MMIO round-trip (I/O registers via the KSEG1 uncached window 0xBF80_xxxx) ------
     // A store/load to the hardware-register block must route through the bus to the device.
-    // 0xBF801074 is I_MASK; a memory-control register round-trips a word; a stubbed timer
+    // 0xBF801074 is I_MASK; a memory-control register round-trips a word; a still-deferred SPU
     // register reads back 0. (KSEG1 masks down to physical 0x1F80_1xxx — the uncached I/O view.)
+    // (The timers used to be the "reads 0" stub here, but they now count on every bus tick, so this
+    // probe targets the SPU block instead — see the dedicated timer section near the end.)
     {
         let prog = [
             lui(1, 0xBF80),    // r1 = 0xBF80_0000
@@ -245,8 +247,8 @@ pub(crate) fn run_selftest() -> bool {
             sw(6, 5, 0),       // mem_control[0] = 0xCAFE
             lw(7, 5, 0),       // r7 <- mem_control[0] (delayed)
             lui(8, 0xBF80),    // (commits the r7 load)
-            ori(8, 8, 0x1100), // r8 = 0xBF80_1100  (timer 0 — stubbed)
-            lw(9, 8, 0),       // r9 <- timer       (delayed)
+            ori(8, 8, 0x1C00), // r8 = 0xBF80_1C00  (an SPU register — deferred, reads 0)
+            lw(9, 8, 0),       // r9 <- SPU reg     (delayed)
             NOP,               // settle the last load
         ];
         let mut cpu = build(&prog);
@@ -254,7 +256,7 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "I_MASK write/read (r3)", cpu.regs[3], 0x0000_000F);
         check(&mut pass, "I_MASK landed in device", cpu.bus.irq.read_mask() as u32, 0x0F);
         check(&mut pass, "mem-control round-trip (r7)", cpu.regs[7], 0x0000_CAFE);
-        check(&mut pass, "stubbed timer reads 0 (r9)", cpu.regs[9], 0);
+        check(&mut pass, "deferred SPU register reads 0 (r9)", cpu.regs[9], 0);
     }
 
     // --- I_STAT acknowledge semantics (write-to-ACK, not write-1-to-clear) -------------
@@ -1033,6 +1035,127 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "GPUSTAT field bit toggled", field_before ^ field_after, 1);
         check(&mut pass, "frame_ready latched", bus.gpu.take_frame() as u32, 1);
         check(&mut pass, "frame_ready clears on read", bus.gpu.take_frame() as u32, 0);
+    }
+
+    // ===== root counters / timers (TIMER0/1/2) ====================================
+    // Drive the bus's catch-up `tick` directly (no CPU) and program the timers through MMIO, exactly
+    // as software would: counter at base+0x0, mode at +0x4, target at +0x8, with bases T0 0x1F80_1100,
+    // T1 0x1F80_1110, T2 0x1F80_1120. I_STAT is 0x1F80_1070 (the timer sources are bits 4/5/6). One
+    // subtlety baked into the setups: writing the mode register **zeroes the counter**, so any seed of
+    // the counter value must come *after* the mode write (and the target before it).
+
+    // --- counts the system clock, and the counter is writable -------------------------
+    {
+        let mut bus = Bus::new();
+        bus.tick(100); // TIMER0 defaults to the system-clock source
+        check(&mut pass, "timer0 counts system clock", bus.read32(0x1F80_1100), 100);
+    }
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1100, 0x1234); // a direct counter write (no latch reset)
+        bus.tick(3);
+        check(&mut pass, "timer0 counter is writable", bus.read32(0x1F80_1100), 0x1237);
+    }
+
+    // --- a mode write resets the counter and raises the IRQ flag (bit 10) -------------
+    {
+        let mut bus = Bus::new();
+        bus.tick(50);
+        bus.write32(0x1F80_1104, 0); // mode write -> counter back to 0, bit 10 high
+        check(&mut pass, "mode write zeroes the counter", bus.read32(0x1F80_1100), 0);
+        check(&mut pass, "mode write sets IRQ flag (bit 10)", (bus.read32(0x1F80_1104) >> 10) & 1, 1);
+    }
+
+    // --- TIMER2 system-clock/8 source divides by 8, carrying the remainder ------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1124, 0x0200); // T2 mode: clock source = system clock / 8 (bits 8-9 = 2)
+        bus.tick(8);
+        check(&mut pass, "timer2 /8: 8 cycles -> 1", bus.read32(0x1F80_1120), 1);
+        bus.tick(7);
+        check(&mut pass, "timer2 /8: +7 cycles -> still 1", bus.read32(0x1F80_1120), 1);
+        bus.tick(1); // the carried remainder (7) + 1 = 8 -> one more tick
+        check(&mut pass, "timer2 /8: +1 cycle -> 2 (remainder carried)", bus.read32(0x1F80_1120), 2);
+    }
+
+    // --- reset-on-target (mode bit 3) wraps the counter at the target ------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1108, 10); // target first ...
+        bus.write32(0x1F80_1104, 0x0008); // ... then mode: reset on target (bit 3)
+        bus.tick(10);
+        check(&mut pass, "reset-on-target wraps at target", bus.read32(0x1F80_1100), 0);
+        bus.tick(5);
+        check(&mut pass, "counter continues after target reset", bus.read32(0x1F80_1100), 5);
+    }
+
+    // --- free-run wraps past 0xFFFF back to 0 -----------------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1104, 0); // mode: free-run, reset on the 0xFFFF wrap
+        bus.write32(0x1F80_1100, 0xFFFE); // seed near the wrap (after the mode write)
+        bus.tick(3); // 0xFFFE -> 0xFFFF -> 0x0000 -> 0x0001
+        check(&mut pass, "counter wraps 0xFFFF -> 0", bus.read32(0x1F80_1100), 1);
+    }
+
+    // --- reached-target latch (bit 11) sets, then clears on a mode read ----------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1108, 5);
+        bus.write32(0x1F80_1104, 0); // free-run, no reset/IRQ — just watch the latch
+        bus.tick(5);
+        check(&mut pass, "reached-target latch set (bit 11)", (bus.read32(0x1F80_1104) >> 11) & 1, 1);
+        check(&mut pass, "reached-target clears on mode read", (bus.read32(0x1F80_1104) >> 11) & 1, 0);
+    }
+
+    // --- reached-0xFFFF latch (bit 12) sets on the wrap -------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1104, 0);
+        bus.write32(0x1F80_1100, 0xFFFF); // one tick from the wrap (after the mode write)
+        bus.tick(1);
+        check(&mut pass, "reached-0xFFFF latch set (bit 12)", (bus.read32(0x1F80_1104) >> 12) & 1, 1);
+    }
+
+    // --- the target IRQ pulls the I_STAT line -----------------------------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1108, 20);
+        bus.write32(0x1F80_1104, 0x0010); // mode bit 4: IRQ when counter == target
+        bus.tick(20);
+        check(&mut pass, "target IRQ raises I_STAT (TIMER0 bit 4)", (bus.read32(0x1F80_1070) >> 4) & 1, 1);
+    }
+
+    // --- one-shot fires exactly once until re-armed (mode bit 6 = 0) -------------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1118, 10);
+        bus.write32(0x1F80_1114, 0x0010); // T1: IRQ on target, one-shot
+        bus.tick(10);
+        check(&mut pass, "one-shot fires (I_STAT TIMER1 bit 5)", (bus.read32(0x1F80_1070) >> 5) & 1, 1);
+        bus.write32(0x1F80_1070, 0); // acknowledge (I_STAT is write-0-to-clear)
+        bus.tick(0x1_0000); // counter sweeps the whole range, hitting the target again
+        check(&mut pass, "one-shot stays silent until re-armed", (bus.read32(0x1F80_1070) >> 5) & 1, 0);
+    }
+
+    // --- repeat mode re-fires every time the condition recurs (mode bit 6 = 1) ---------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1118, 10);
+        bus.write32(0x1F80_1114, 0x0058); // T1: IRQ on target (4) + repeat (6) + reset-on-target (3)
+        bus.tick(10);
+        check(&mut pass, "repeat IRQ fires first time", (bus.read32(0x1F80_1070) >> 5) & 1, 1);
+        bus.write32(0x1F80_1070, 0); // acknowledge
+        bus.tick(10);
+        check(&mut pass, "repeat IRQ fires again after reset", (bus.read32(0x1F80_1070) >> 5) & 1, 1);
+    }
+
+    // --- a GPU-derived source is inert until M4.5b (locks the deferral) ----------------
+    {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_1104, 0x0100); // T0 mode: clock source = dot clock (bits 8-9 = 1)
+        bus.tick(1000);
+        check(&mut pass, "dotclock source inert (no GPU timing yet)", bus.read32(0x1F80_1100), 0);
     }
 
     println!(

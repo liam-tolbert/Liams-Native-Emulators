@@ -33,6 +33,7 @@ mod gpu;
 mod img;
 mod irq;
 mod selftest;
+mod timer;
 
 use bus::Bus;
 use cpu::Cpu;

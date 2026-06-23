@@ -27,6 +27,7 @@
 use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::irq::Irq;
+use crate::timer::Timers;
 
 const RAM_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 const SCRATCH_SIZE: usize = 1024; // 1 KiB
@@ -66,6 +67,7 @@ pub struct Bus {
     pub irq: Irq,
     pub gpu: Gpu,
     pub dma: Dma,
+    pub timers: Timers,
 
     mem_control: [u32; 0x24], // 0x1F801000-0x1F80105F + RAM_SIZE/cache regs, just stored
     cache_control: u32,       // 0xFFFE0130
@@ -84,6 +86,7 @@ impl Bus {
             irq: Irq::new(),
             gpu: Gpu::new(),
             dma: Dma::new(),
+            timers: Timers::new(),
             mem_control: [0; 0x24],
             cache_control: 0,
             tty_out: String::new(),
@@ -115,6 +118,16 @@ impl Bus {
     pub fn tick(&mut self, cycles: u32) {
         if self.gpu.tick(cycles) {
             self.irq.raise(crate::irq::source::VBLANK);
+        }
+        // The root counters share the same system-clock catch-up. Each one that crosses an enabled
+        // IRQ boundary comes back in the fired-mask; we raise its I_STAT source here on the bus —
+        // only the bus owns both the timers and the interrupt controller, the same reason `run_dma`
+        // raises the DMA IRQ here rather than inside the device.
+        let fired = self.timers.tick(cycles);
+        for n in 0..3u8 {
+            if fired & (1 << n) != 0 {
+                self.irq.raise(Timers::irq_source(n));
+            }
         }
     }
 
@@ -372,7 +385,7 @@ impl Bus {
             0x074 => self.irq.read_mask() as u32, // I_MASK
             0x0F4 => self.dma.dicr_read(),        // DICR: bit 31 (master flag) is computed, not stored
             0x080..=0x0FF => self.dma.read(offset - 0x080),
-            0x100..=0x12F => 0, // timers
+            0x100..=0x12F => self.timers.read(offset - 0x100),
             0x810 => self.gpu.read(),    // GPUREAD
             0x814 => self.gpu.status(),  // GPUSTAT
             0xC00..=0xFFF => 0, // SPU (deferred, like the DMG APU)
@@ -393,7 +406,7 @@ impl Bus {
                 self.dma.write(dma_off, val);
                 self.dma_maybe_trigger(dma_off, val);
             }
-            0x100..=0x12F => {} // timers
+            0x100..=0x12F => self.timers.write(offset - 0x100, val),
             0x810 => self.gpu.gp0(val),
             0x814 => self.gpu.gp1(val),
             0xC00..=0xFFF => {} // SPU
