@@ -912,10 +912,6 @@ fn resolve_cue(path: &str) -> Option<std::path::PathBuf> {
 struct PollDiag {
     summary: String,
     top: Option<u32>,
-    /// [TEMP M6] extra diagnostic lines: per-offset reader PC + value range, interrupts taken during
-    /// the sample, the timer state the game programmed, and a disassembly of the loop. Removed with the
-    /// scaffolding once the bug is fixed.
-    details: Vec<String>,
 }
 
 /// Why the post-boot run stopped — the signal that picks the next milestone. `pc`/`instr` name the
@@ -957,11 +953,6 @@ impl StallReport {
                 (cause >> 8) & 0xFF,
             );
             println!("[disc] suggested next: {}", poll_verdict(diag.top));
-            // [TEMP M6] the deep diagnostic detail — what each polled register reads, whether the
-            // VBlank handler runs, how the timer is programmed, and the loop disassembly.
-            for line in &diag.details {
-                println!("[disc] {line}");
-            }
         }
 
         let tty = cpu.bus.tty_out.trim_end();
@@ -977,128 +968,18 @@ impl StallReport {
 /// Once a poll-wait is detected, run a short window with the MMIO-read tap armed and tally which I/O
 /// register(s) the loop reads. The hottest is what it is spinning on. This is the concrete, recorded
 /// signal that orders the next milestone — it turns "stuck somewhere" into "polling 0x1F801DAE".
-///
-/// [TEMP M6] beyond the count, it now also captures the reading PC + value range per register, the
-/// interrupts actually taken during the loop, the timer programming, and a disassembly of the loop —
-/// all to pin the exact frame-sync predicate. This extra detail (and `PollDiag::details`) is removed
-/// with the rest of the M6 scaffolding once the fix lands.
 fn diagnose_poll(cpu: &mut Cpu) -> PollDiag {
     // Generous so even a poll loop that calls deep into the BIOS each pass (few iterations per 100k
-    // instrs) still tallies its target many times. We've already spent ~24M of the 50M budget getting
-    // here; a 1M-instruction diagnostic sample is cheap and one-time.
+    // instrs) still tallies its target many times; a 1M-instruction diagnostic sample is cheap.
     const SAMPLE: u64 = 1_000_000;
-    let parked_pc = cpu.pc;
     *cpu.bus.io_trace.borrow_mut() = Some(std::collections::HashMap::new());
-    cpu.diag_irq = [0; 16];
-    // [TEMP M6] last-exception context captured *before* the sample perturbs it: for a frozen /
-    // BIOS-SystemError hang, CAUSE.ExcCode + EPC name the instruction that actually faulted.
-    let exc_code = (cpu.cop0.cause >> 2) & 0x1F;
-    let epc = cpu.cop0.epc;
-    let epc_instr = cpu.bus.read32(epc);
-    // [TEMP M6] MvC's outer loop waits on the frame counter at 0x8001E214 (getCount(-1) returns it);
-    // sample it across the window to see whether the VBlank handler is actually advancing it.
-    let fc_before = cpu.bus.read32(0x8001_E214);
     for _ in 0..SAMPLE {
         cpu.step();
     }
-    let fc_after = cpu.bus.read32(0x8001_E214);
     let hist = cpu.bus.io_trace.borrow_mut().take().unwrap_or_default();
 
-    let mut entries: Vec<(u32, crate::bus::IoTap)> = hist.into_iter().collect();
-    entries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(&b.0)));
-
-    // [TEMP M6] assemble the deep detail lines.
-    let mut details = Vec::new();
-    for (off, tap) in entries.iter().take(4) {
-        let state = if tap.min_val == tap.max_val { "STUCK" } else { "changing" };
-        details.push(format!(
-            "read 0x{:08X} ({:<14}) x{:<8} by pc=0x{:08X}  val {:08X}..{:08X} last={:08X} [{state}]",
-            0x1F80_1000 + off,
-            Bus::io_name(*off),
-            tap.count,
-            tap.last_pc,
-            tap.min_val,
-            tap.max_val,
-            tap.last_val,
-        ));
-    }
-    details.push(format!(
-        "last exception: ExcCode=0x{exc_code:02X} ({}) EPC=0x{epc:08X} instr@EPC=0x{epc_instr:08X}",
-        exc_name(exc_code)
-    ));
-    if epc != 0 {
-        details.push(format!("disasm @ EPC 0x{epc:08X} (the faulting instruction):"));
-        for line in disasm(cpu, epc.wrapping_sub(0x10), 9) {
-            details.push(format!("  {line}"));
-        }
-    }
-    let irq_total: u64 = cpu.diag_irq.iter().sum();
-    let irq_parts: Vec<String> = (0..16)
-        .filter(|&b| cpu.diag_irq[b] > 0)
-        .map(|b| format!("{}={}x", irq_src_name(b), cpu.diag_irq[b]))
-        .collect();
-    details.push(format!(
-        "IRQs taken during sample: total={irq_total} [{}] — {}",
-        irq_parts.join(" "),
-        if irq_total == 0 {
-            "the BIOS interrupt handler is NOT entered during the loop"
-        } else {
-            "the handler IS entered (so the wait is on a flag/value it doesn't update)"
-        }
-    ));
-    for n in 0..3 {
-        let (val, mode, target) = cpu.bus.timers.diag_snapshot(n);
-        let src = (mode >> 8) & 3;
-        let sync = if mode & 1 != 0 {
-            ((mode >> 1) & 3).to_string()
-        } else {
-            "off".into()
-        };
-        details.push(format!(
-            "TIMER{n} value=0x{val:04X} target=0x{target:04X} mode=0x{mode:04X} (src={src} reset_on_target={} sync={sync})",
-            (mode >> 3) & 1,
-        ));
-    }
-    // Disassemble the loop: around the parked PC, the live PC, the caller (ra = the outer waiter),
-    // and each hottest reader.
-    details.push(format!("disasm @ parked pc 0x{parked_pc:08X}:"));
-    for line in disasm(cpu, parked_pc.wrapping_sub(0x20), 14) {
-        details.push(format!("  {line}"));
-    }
-    details.push(format!("disasm @ live pc 0x{:08X}:", cpu.pc));
-    for line in disasm(cpu, cpu.pc.wrapping_sub(0x20), 16) {
-        details.push(format!("  {line}"));
-    }
-    details.push(format!("disasm @ caller ra=0x{:08X} (the outer waiter):", cpu.regs[31]));
-    for line in disasm(cpu, cpu.regs[31].wrapping_sub(0x2C), 22) {
-        details.push(format!("  {line}"));
-    }
-    if let Some((_, tap)) = entries.first() {
-        // Wide window so it covers the whole count function the readers live in (how the count the
-        // outer loop waits on is computed).
-        details.push(format!("disasm @ count function near pc 0x{:08X}:", tap.last_pc));
-        for line in disasm(cpu, tap.last_pc.wrapping_sub(0x28), 76) {
-            details.push(format!("  {line}"));
-        }
-    }
-    details.push(format!(
-        "frame counter *0x8001E214: before=0x{fc_before:08X} after=0x{fc_after:08X} (delta {}) — {}",
-        fc_after.wrapping_sub(fc_before),
-        if fc_after == fc_before {
-            "NOT advancing → the VBlank handler isn't incrementing it (the bug)"
-        } else {
-            "advancing → this is a long legitimate wait, not a hang"
-        }
-    ));
-    // [TEMP M6] dump the globals the outer waiter compares (target/accumulator) + the field cache.
-    for base in [0x8002_04A0u32, 0x8001_D0E0] {
-        let mut row = format!("ram 0x{base:08X}:");
-        for k in 0..6 {
-            row.push_str(&format!(" {:08X}", cpu.bus.read32(base + k * 4)));
-        }
-        details.push(row);
-    }
-
+    let mut entries: Vec<(u32, u64)> = hist.into_iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     if entries.is_empty() {
         return PollDiag {
             summary: format!(
@@ -1106,114 +987,16 @@ fn diagnose_poll(cpu: &mut Cpu) -> PollDiag {
                  variable, not a device port (it is waiting for an interrupt handler to update it)"
             ),
             top: None,
-            details,
         };
     }
     let parts: Vec<String> = entries
         .iter()
         .take(3)
-        .map(|(off, tap)| format!("0x{:08X} ({}) x{}", 0x1F80_1000 + off, Bus::io_name(*off), tap.count))
+        .map(|(off, n)| format!("0x{:08X} ({}) x{n}", 0x1F80_1000 + off, Bus::io_name(*off)))
         .collect();
     PollDiag {
         summary: format!("over {SAMPLE} sampled instructions the loop polls {}", parts.join(", ")),
         top: entries.first().map(|(off, _)| *off),
-        details,
-    }
-}
-
-/// [TEMP M6 scaffolding] short name for an I_STAT source bit, for the interrupts-taken tally.
-fn irq_src_name(bit: usize) -> &'static str {
-    match bit {
-        0 => "VBLANK",
-        1 => "GPU",
-        2 => "CDROM",
-        3 => "DMA",
-        4 => "TMR0",
-        5 => "TMR1",
-        6 => "TMR2",
-        7 => "PAD",
-        _ => "?",
-    }
-}
-
-/// [TEMP M6 scaffolding] a tiny MIPS-I disassembler — just the common ops, enough to read a poll-loop
-/// predicate (loads, the lui/ori address build, the and/compare, and the branch that closes the loop).
-/// Reads straight from RAM through the bus. Removed with the rest of the scaffolding once the fix lands.
-fn disasm(cpu: &Cpu, start: u32, n: u32) -> Vec<String> {
-    (0..n)
-        .map(|i| {
-            let pc = start.wrapping_add(i * 4);
-            let w = cpu.bus.read32(pc);
-            format!("0x{pc:08X}: {w:08X}  {}", decode_mips(w, pc))
-        })
-        .collect()
-}
-
-fn decode_mips(w: u32, pc: u32) -> String {
-    let op = w >> 26;
-    let rs = ((w >> 21) & 0x1F) as usize;
-    let rt = ((w >> 16) & 0x1F) as usize;
-    let rd = ((w >> 11) & 0x1F) as usize;
-    let sh = (w >> 6) & 0x1F;
-    let funct = w & 0x3F;
-    let imm = (w & 0xFFFF) as i16 as i32;
-    let immu = w & 0xFFFF;
-    let r = |i: usize| REG_NAMES[i];
-    let btgt = pc.wrapping_add(4).wrapping_add((imm as u32) << 2);
-    let jtgt = (pc & 0xF000_0000) | ((w & 0x03FF_FFFF) << 2);
-    match op {
-        0x00 => match funct {
-            0x00 if w == 0 => "nop".into(),
-            0x00 => format!("sll {},{},{sh}", r(rd), r(rt)),
-            0x02 => format!("srl {},{},{sh}", r(rd), r(rt)),
-            0x03 => format!("sra {},{},{sh}", r(rd), r(rt)),
-            0x04 => format!("sllv {},{},{}", r(rd), r(rt), r(rs)),
-            0x06 => format!("srlv {},{},{}", r(rd), r(rt), r(rs)),
-            0x08 => format!("jr {}", r(rs)),
-            0x09 => format!("jalr {},{}", r(rd), r(rs)),
-            0x10 => format!("mfhi {}", r(rd)),
-            0x12 => format!("mflo {}", r(rd)),
-            0x18 => format!("mult {},{}", r(rs), r(rt)),
-            0x1A => format!("div {},{}", r(rs), r(rt)),
-            0x1B => format!("divu {},{}", r(rs), r(rt)),
-            0x20 => format!("add {},{},{}", r(rd), r(rs), r(rt)),
-            0x21 => format!("addu {},{},{}", r(rd), r(rs), r(rt)),
-            0x22 => format!("sub {},{},{}", r(rd), r(rs), r(rt)),
-            0x23 => format!("subu {},{},{}", r(rd), r(rs), r(rt)),
-            0x24 => format!("and {},{},{}", r(rd), r(rs), r(rt)),
-            0x25 => format!("or {},{},{}", r(rd), r(rs), r(rt)),
-            0x26 => format!("xor {},{},{}", r(rd), r(rs), r(rt)),
-            0x27 => format!("nor {},{},{}", r(rd), r(rs), r(rt)),
-            0x2A => format!("slt {},{},{}", r(rd), r(rs), r(rt)),
-            0x2B => format!("sltu {},{},{}", r(rd), r(rs), r(rt)),
-            _ => format!("special funct=0x{funct:02X}"),
-        },
-        0x01 => format!("bcond {},0x{btgt:08X}", r(rs)),
-        0x02 => format!("j 0x{jtgt:08X}"),
-        0x03 => format!("jal 0x{jtgt:08X}"),
-        0x04 => format!("beq {},{},0x{btgt:08X}", r(rs), r(rt)),
-        0x05 => format!("bne {},{},0x{btgt:08X}", r(rs), r(rt)),
-        0x06 => format!("blez {},0x{btgt:08X}", r(rs)),
-        0x07 => format!("bgtz {},0x{btgt:08X}", r(rs)),
-        0x08 => format!("addi {},{},{imm}", r(rt), r(rs)),
-        0x09 => format!("addiu {},{},{imm}", r(rt), r(rs)),
-        0x0A => format!("slti {},{},{imm}", r(rt), r(rs)),
-        0x0B => format!("sltiu {},{},{imm}", r(rt), r(rs)),
-        0x0C => format!("andi {},{},0x{immu:04X}", r(rt), r(rs)),
-        0x0D => format!("ori {},{},0x{immu:04X}", r(rt), r(rs)),
-        0x0E => format!("xori {},{},0x{immu:04X}", r(rt), r(rs)),
-        0x0F => format!("lui {},0x{immu:04X}", r(rt)),
-        0x10 => format!("cop0 0x{:07X}", w & 0x01FF_FFFF),
-        0x12 => format!("cop2/GTE 0x{:07X}", w & 0x01FF_FFFF),
-        0x20 => format!("lb {},{imm}({})", r(rt), r(rs)),
-        0x21 => format!("lh {},{imm}({})", r(rt), r(rs)),
-        0x23 => format!("lw {},{imm}({})", r(rt), r(rs)),
-        0x24 => format!("lbu {},{imm}({})", r(rt), r(rs)),
-        0x25 => format!("lhu {},{imm}({})", r(rt), r(rs)),
-        0x28 => format!("sb {},{imm}({})", r(rt), r(rs)),
-        0x29 => format!("sh {},{imm}({})", r(rt), r(rs)),
-        0x2B => format!("sw {},{imm}({})", r(rt), r(rs)),
-        _ => format!("op=0x{op:02X}"),
     }
 }
 
