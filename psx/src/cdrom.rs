@@ -312,19 +312,19 @@ impl Cdrom {
                 self.double_speed = false;
                 self.reading = false;
                 self.status = ST_MOTOR;
-                self.queue.clear();
+                self.abort_queue();
                 self.enqueue(3, vec![self.status], INIT_ACK);
                 self.enqueue(2, vec![self.status], INIT_DONE);
             }
             0x09 | 0x08 => {
-                // Pause / Stop — halt streaming (and, for Stop, the motor). Clearing the queue drops
+                // Pause / Stop — halt streaming (and, for Stop, the motor). Aborting the queue drops
                 // any in-flight ReadN sector so the stream really stops.
                 self.reading = false;
                 self.status &= !ST_READ;
                 if cmd == 0x08 {
                     self.status &= !ST_MOTOR;
                 }
-                self.queue.clear();
+                self.abort_queue();
                 self.enqueue(3, vec![self.status], ack);
                 self.enqueue(2, vec![self.status], ack);
             }
@@ -378,6 +378,19 @@ impl Cdrom {
 
     fn enqueue(&mut self, int: u8, response: Vec<u8>, delay: u32) {
         self.queue.push_back(CdEvent { int, response, delay, load_sector: false, reschedule: false });
+    }
+
+    /// Abort every pending reply *and disarm the engine* — used by Stop/Pause/Init to cancel an
+    /// in-flight read. **Gotcha (the bug this fixes):** an event is "armed" (counting down in
+    /// `countdown`) while it is still sitting at `queue.front()` — `tick` only `pop_front`s it when it
+    /// fires. So clearing the queue alone leaves `armed`/`countdown` pointing at the just-dropped event,
+    /// and the command's *own* first reply (queued right after) then inherits that stale countdown
+    /// instead of its proper delay (e.g. a Pause issued mid-ReadN delivered its INT3 a whole sector
+    /// period late). Resetting `armed`/`countdown` here makes the next `enqueue` arm fresh.
+    fn abort_queue(&mut self) {
+        self.queue.clear();
+        self.armed = false;
+        self.countdown = 0;
     }
 
     // ===== the catch-up tick — advance the event queue ==========================================
