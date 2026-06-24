@@ -52,10 +52,11 @@ const SECTOR_RAW_LEN: usize = 2352;
 // ===== drive status byte (the first response byte of most commands) =============================
 const ST_ERROR: u8 = 0x01;
 const ST_MOTOR: u8 = 0x02; // spindle motor on
+const ST_SEEKERR: u8 = 0x04; // last seek failed (e.g. a target past the end of the disc)
 const ST_SEEK: u8 = 0x40; // currently seeking
 const ST_READ: u8 = 0x20; // currently reading data sectors
 const ST_IDERR: u8 = 0x08; // disc-identification error
-// (unused-for-now bits: 0x04 seek-error, 0x10 shell-open, 0x80 playing CD-DA)
+// (unused-for-now bits: 0x10 shell-open, 0x80 playing CD-DA)
 
 /// One scheduled piece of a command's reply. A command enqueues one or more of these; the queue is
 /// drained one event at a time, each gated on the host acknowledging the previous interrupt.
@@ -101,6 +102,13 @@ pub struct Cdrom {
     reading: bool,     // a ReadN/ReadS is active
     sector_buf: [u8; SECTOR_RAW_LEN], // the most-recently-loaded raw sector
 
+    // GetlocL reports the header of the sector *currently under the head*. That only exists once a
+    // seek or a read has actually positioned there: after a bare Init/reset there is none, and the
+    // drive answers GetlocL with an INT5 error. `loc_lba` is that sector (the last one read, not the
+    // next), `loc_valid` whether a position has been established. (Pinned by ps1-tests cdrom/getloc.)
+    loc_lba: u32,
+    loc_valid: bool,
+
     // ----- the request/response engine -----
     queue: VecDeque<CdEvent>, // events not yet armed
     countdown: u32,           // cycles left on the armed head
@@ -131,6 +139,8 @@ impl Cdrom {
             read_lba: 0,
             reading: false,
             sector_buf: [0; SECTOR_RAW_LEN],
+            loc_lba: 0,
+            loc_valid: false,
             queue: VecDeque::new(),
             countdown: 0,
             armed: false,
@@ -143,6 +153,7 @@ impl Cdrom {
     pub fn load_disc(&mut self, img: CdImage) {
         self.disc = Some(img);
     }
+
 
     /// Borrow the inserted disc for *host-side* reads. The HLE disc-boot loader walks the disc's
     /// ISO9660 filesystem through this (to find `SYSTEM.CNF` and the boot executable) while the disc
@@ -278,6 +289,15 @@ impl Cdrom {
     /// Not modelled: a genuine *raw* whole-sector read (offset 00h — for the MODE2 subheader / CD-DA /
     /// copy-protection). No data game needs it; revisit when XA audio / FMV (the SPU/MDEC milestone)
     /// lands, since XA reads the subheader.
+    /// Is the last Setloc target beyond the last sector of the inserted disc? (No disc -> not "past
+    /// end" — a no-disc seek fails elsewhere via GetID/IDERR, not here.) Used to fail an out-of-range
+    /// SeekL with INT5, matching real hardware (ps1-tests cdrom/getloc seeks to 74:30:00 and gets INT5).
+    fn seek_past_end(&self) -> bool {
+        self.disc
+            .as_ref()
+            .is_some_and(|d| self.seek_target >= d.sector_count() as u32)
+    }
+
     fn sector_data_range(&self) -> (usize, usize) {
         if self.mode & 0x20 != 0 {
             (24, 2328) // user data + EDC + ECC (raw 24..2352), MODE2 header/subheader skipped
@@ -329,6 +349,7 @@ impl Cdrom {
                 self.double_speed = false;
                 self.reading = false;
                 self.status = ST_MOTOR;
+                self.loc_valid = false; // no sector under the head until the next seek/read
                 self.abort_queue();
                 self.enqueue(3, vec![self.status], INIT_ACK);
                 self.enqueue(2, vec![self.status], INIT_DONE);
@@ -347,10 +368,22 @@ impl Cdrom {
             }
             0x0B | 0x0C => self.enqueue(3, vec![self.status], ack), // Mute / Demute (no audio yet)
             0x15 | 0x16 => {
-                // SeekL / SeekP — move to the Setloc target; two-phase (ack, then complete).
+                // SeekL / SeekP — move to the Setloc target; two-phase (ack, then complete). A seek
+                // *past the end of the disc* fails: the INT3 ack still comes, but the second phase is an
+                // INT5 error carrying the seek-error status (bit 2), and no position is established — so
+                // a following GetlocL/P also errors. (ps1-tests cdrom/getloc.)
                 self.read_lba = self.seek_target;
-                self.enqueue(3, vec![self.status | ST_SEEK], ack);
-                self.enqueue(2, vec![self.status], SEEK_DELAY);
+                if self.seek_past_end() {
+                    self.status = ST_SEEKERR; // motor implicitly drops; matches the golden status 0x04
+                    self.loc_valid = false;
+                    self.enqueue(3, vec![ST_SEEK | ST_MOTOR], ack);
+                    self.enqueue(5, vec![self.status], SEEK_DELAY);
+                } else {
+                    self.loc_lba = self.seek_target;
+                    self.loc_valid = true;
+                    self.enqueue(3, vec![self.status | ST_SEEK], ack);
+                    self.enqueue(2, vec![self.status], SEEK_DELAY);
+                }
             }
             0x06 | 0x1B => {
                 // ReadN / ReadS — start streaming sectors from the Setloc target. INT3 ack, then an
@@ -380,13 +413,24 @@ impl Cdrom {
             0x13 => self.enqueue(3, vec![self.status, 0x01, 0x01], ack), // GetTN — first/last track (BCD)
             0x1E => self.enqueue(3, vec![self.status], ack),            // GetTD / ReadTOC — no-op stub
             0x10 => {
-                // GetlocL — position from the current sector header (synthesised from read_lba).
-                let (m, s, f) = lba_to_msf_bcd(self.read_lba);
-                self.enqueue(3, vec![m, s, f, 0x02, 0x00, 0x00, 0x00, 0x00], ack);
+                // GetlocL — the data-sector header (amm:ass:asect + mode + the 4 subheader bytes) of the
+                // sector under the head. With no valid position (a bare Init/reset, or after a failed
+                // seek) there is no header to report, so the drive errors with INT5 carrying the current
+                // status. (ps1-tests cdrom/getloc: "GetlocL failed, IRQ = 5".)
+                if self.loc_valid {
+                    let (m, s, f) = lba_to_msf_bcd(self.loc_lba);
+                    self.enqueue(3, vec![m, s, f, 0x02, 0x00, 0x00, 0x00, 0x00], ack);
+                } else {
+                    // The INT5 first byte is the *current* status (0x02 after reset, 0x04 after a failed
+                    // seek), not status|error — the golden prints exactly that. 0x80 = the reason byte.
+                    self.enqueue(5, vec![self.status, 0x80], ack);
+                }
             }
             0x11 => {
-                // GetlocP — subchannel-Q position (synthesised: single track, abs == rel here).
-                let (m, s, f) = lba_to_msf_bcd(self.read_lba);
+                // GetlocP — subchannel-Q position (synthesised: single track, abs == rel here). Unlike
+                // GetlocL this is available even before a read (the Q channel is always tracked), so it
+                // doesn't gate on `loc_valid`.
+                let (m, s, f) = lba_to_msf_bcd(self.loc_lba);
                 self.enqueue(3, vec![0x01, 0x01, m, s, f, m, s, f], ack);
             }
             _ => self.enqueue(5, vec![self.status | ST_ERROR, 0x40], ack), // unknown -> error INT5
@@ -444,6 +488,10 @@ impl Cdrom {
             if let Some(s) = self.disc.as_ref().map(|d| d.read_sector(lba)) {
                 self.sector_buf = s;
             }
+            // The sector just read is now under the head: GetlocL reports *this* lba (not read_lba,
+            // which we advance to the next one), and a position is now valid.
+            self.loc_lba = lba;
+            self.loc_valid = true;
             self.read_lba = lba.wrapping_add(1);
         }
         {

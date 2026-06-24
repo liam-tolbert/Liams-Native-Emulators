@@ -65,6 +65,7 @@ fn main() {
         eprintln!("  {me} <bios.bin> dump [N]    headless: run N frames -> VRAM PNG");
         eprintln!("  {me} <bios.bin> disc <.cue>         boot a real disc, headless, report the stall");
         eprintln!("  {me} <bios.bin> disc <.cue> window  boot a real disc in a window (watch it render)");
+        eprintln!("  {me} <bios.bin> cdtest <test.exe> <.cue>  sideload a CD test ROM with a disc inserted");
         std::process::exit(1);
     }
 
@@ -133,6 +134,15 @@ fn main() {
             } else {
                 run_disc(&mut cpu, path);
             }
+        }
+        Some("cdtest") => {
+            // `cdtest <test.exe> [disc.cue]` — sideload a CD test ROM with a disc inserted (the
+            // ps1-tests `cdrom/` ROMs query the drive, so they need a disc present).
+            let exe = args.get(3).map(String::as_str).unwrap_or_else(|| {
+                eprintln!("usage: <bios.bin> cdtest <test.exe> [disc.cue]");
+                std::process::exit(1);
+            });
+            run_cdtest(&mut cpu, exe, args.get(4).map(String::as_str));
         }
         Some(other) => {
             run_sideload(&mut cpu, other);
@@ -706,6 +716,33 @@ fn run_disc(cpu: &mut Cpu, path_arg: Option<&str>) {
 /// inject it. On any failure it prints the reason and exits — the same contract `run_disc` had inline.
 /// On return the CPU is poised at the game's entry point, the disc still inserted for asset streaming;
 /// the two modes differ only in what they do next (report a stall vs. present frames).
+/// Resolve a `.cue` (a file, or a directory holding exactly one) and insert it into the drive. Shared
+/// by the disc-boot mode and the `cdtest` harness. Exits with a message if the image can't be opened.
+fn attach_disc(cpu: &mut Cpu, path: &str) {
+    let cue = resolve_cue(path).unwrap_or_else(|| {
+        eprintln!("[disc] no .cue found at '{path}'");
+        std::process::exit(1);
+    });
+    let img = CdImage::from_cue(&cue).unwrap_or_else(|e| {
+        eprintln!("[disc] failed to open the disc image for '{}': {e}", cue.display());
+        std::process::exit(1);
+    });
+    println!("\n[disc] attached {} ({} sectors)", cue.display(), img.sector_count());
+    cpu.bus.cdrom.load_disc(img);
+}
+
+/// Sideload a CD test ROM with a disc inserted: the ps1-tests `cdrom/` ROMs query the drive (Getloc,
+/// seek, read), so they need a disc present — the plain sideload path doesn't attach one. The exact
+/// MSF positions are disc-specific (the suite ships its own test disc we don't have), so the value is
+/// the *behaviour* the run prints (which Getloc/seek succeed vs error, the IRQ numbers) read against
+/// the sibling `psx.log`, not a byte-exact MATCH.
+fn run_cdtest(cpu: &mut Cpu, exe_path: &str, disc_path: Option<&str>) {
+    if let Some(d) = disc_path {
+        attach_disc(cpu, d);
+    }
+    run_sideload(cpu, exe_path);
+}
+
 fn boot_disc(cpu: &mut Cpu, path_arg: Option<&str>) {
     if !cpu.bus.bios_loaded() {
         eprintln!("\n(disc boot needs a BIOS as the first argument — a 512 KiB image)");
@@ -717,20 +754,7 @@ fn boot_disc(cpu: &mut Cpu, path_arg: Option<&str>) {
     });
 
     // 1. Resolve the .cue (accept a .cue directly, or a directory holding exactly one) and attach it.
-    let cue = resolve_cue(path).unwrap_or_else(|| {
-        eprintln!("[disc] no .cue found at '{path}'");
-        std::process::exit(1);
-    });
-    let img = CdImage::from_cue(&cue).unwrap_or_else(|e| {
-        eprintln!("[disc] failed to open the disc image for '{}': {e}", cue.display());
-        std::process::exit(1);
-    });
-    println!(
-        "\n[disc] attached {} ({} sectors)",
-        cue.display(),
-        img.sector_count()
-    );
-    cpu.bus.cdrom.load_disc(img);
+    attach_disc(cpu, path);
 
     // 2. Boot the real BIOS to the exec hand-off, so the kernel tables + a valid stack exist.
     cpu.capture_tty = true;
@@ -1075,7 +1099,10 @@ fn exc_name(code: u32) -> &'static str {
 fn run_until_stall(cpu: &mut Cpu) -> StallReport {
     // Generous: must outlast realistic multi-second timed waits (≈282k instrs/frame, so ~960 frames is
     // ~270M instrs) so we run *past* them to the real wall rather than mistaking the wait for a stall.
-    const DISC_BUDGET: u64 = 600_000_000;
+    // A legitimate boot can sit in a long *timed* wait (MvC's libetc startup spins ~1200 vblanks ≈ 20 s
+    // before timing out). The frozen-detector below is the real "hung" signal; this budget is just the
+    // runaway backstop, so it must be generous enough not to cut a healthy long wait short (600M did).
+    const DISC_BUDGET: u64 = 1_500_000_000;
     const FAULT_LIMIT: u64 = 2_048; // the same instruction faulting this many times == stuck
     // No new code, no new TTY, AND no interrupt taken for this long == frozen (a live machine waiting on
     // VBlank trips its interrupt every ~282k instrs, far under this, so a healthy wait never frozes out).

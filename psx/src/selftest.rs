@@ -1458,6 +1458,68 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "cd sector 1 data byte", bus.read32(0x1F80_1802) & 0xFF, 0xA1);
     }
 
+    // --- GetlocL gates on a valid position (ps1-tests cdrom/getloc) -------------------
+    // GetlocL reports the header of the sector under the head; with none (a bare reset) it errors
+    // with INT5, and after a SeekL it succeeds with the sought position.
+    {
+        let mut bus = Bus::new();
+        bus.cdrom.load_disc(synth_disc());
+        // (a) GetlocL before any seek/read -> INT5 error.
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x10); // GetlocL
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1); // index 1 to read the Interrupt Flag (not IE)
+        check(&mut pass, "cd GetlocL errors before a seek/read", bus.read32(0x1F80_1803) & 7, 5);
+        bus.write32(0x1F80_1803, 0x07); // ack
+        // (b) Setloc 00:02:04 (LBA 4) -> SeekL -> complete; then GetlocL succeeds with that frame.
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1802, 0x00);
+        bus.write32(0x1F80_1802, 0x02);
+        bus.write32(0x1F80_1802, 0x04); // BCD 00:02:04 -> LBA 4
+        bus.write32(0x1F80_1801, 0x02); // Setloc
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        bus.write32(0x1F80_1803, 0x07);
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x15); // SeekL
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        bus.write32(0x1F80_1803, 0x07); // ack INT3
+        bus.tick(1_100_000); // past the seek delay -> INT2 complete
+        bus.write32(0x1F80_1803, 0x07); // ack INT2
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x10); // GetlocL again
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1); // index 1 to read the Interrupt Flag
+        check(&mut pass, "cd GetlocL succeeds after a seek", bus.read32(0x1F80_1803) & 7, 3);
+        let _m = bus.read32(0x1F80_1801) & 0xFF; // minute (00)
+        let _s = bus.read32(0x1F80_1801) & 0xFF; // second (02)
+        check(&mut pass, "cd GetlocL reports the sought frame (04)", bus.read32(0x1F80_1801) & 0xFF, 0x04);
+    }
+
+    // --- SeekL past the end of the disc fails with INT5 + seek-error status -----------
+    {
+        let mut bus = Bus::new();
+        bus.cdrom.load_disc(synth_disc()); // 16 sectors (LBA 0..15)
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1802, 0x00);
+        bus.write32(0x1F80_1802, 0x03);
+        bus.write32(0x1F80_1802, 0x00); // BCD 00:03:00 -> LBA 75, well past the 16-sector disc
+        bus.write32(0x1F80_1801, 0x02); // Setloc
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        bus.write32(0x1F80_1803, 0x07); // ack Setloc
+        bus.write32(0x1F80_1800, 0);
+        bus.write32(0x1F80_1801, 0x15); // SeekL
+        bus.tick(60_000);
+        bus.write32(0x1F80_1800, 1);
+        check(&mut pass, "cd SeekL past end: INT3 ack", bus.read32(0x1F80_1803) & 7, 3);
+        bus.write32(0x1F80_1803, 0x07); // ack INT3
+        bus.tick(1_100_000); // past the seek delay -> the error phase
+        check(&mut pass, "cd SeekL past end: INT5 error", bus.read32(0x1F80_1803) & 7, 5);
+        check(&mut pass, "cd SeekL past end: seek-error status 0x04", bus.read32(0x1F80_1801) & 0xFF, 0x04);
+    }
+
     // --- a sector pulled into RAM via DMA channel 3 -----------------------------------
     {
         let mut bus = Bus::new();
