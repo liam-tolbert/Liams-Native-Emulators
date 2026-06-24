@@ -77,6 +77,13 @@ pub struct Bus {
     /// Everything the BIOS has printed over the kernel TTY. The TTY harness watches this for
     /// a "Passed"/"Failed" verdict — the direct analog of the Game Boy's `serial_out`.
     pub tty_out: String,
+
+    /// A diagnostic MMIO-read tap, **off by default** (`None`). When armed (`Some(map)`), every
+    /// `io_read` bumps a histogram of `offset -> count`. The `disc` stall report arms it for a short
+    /// window once it has detected a poll-wait, so it can name *which* register the loop is spinning
+    /// on. Behind a `RefCell` because `io_read` is on the CPU's `&self` read path; left `None` it costs
+    /// the hot path a single `borrow`+`is_none` branch, so `cpu/cop` and the self-test are unaffected.
+    pub io_trace: std::cell::RefCell<Option<std::collections::HashMap<u32, u64>>>,
 }
 
 impl Bus {
@@ -93,6 +100,7 @@ impl Bus {
             mem_control: [0; 0x24],
             cache_control: 0,
             tty_out: String::new(),
+            io_trace: std::cell::RefCell::new(None),
         }
     }
 
@@ -408,6 +416,10 @@ impl Bus {
     // here rather than whatever the hardware floats. None of that matters to the BIOS boot or the
     // amidog CPU tests, so it's deferred until a test ROM actually depends on it.
     fn io_read(&self, offset: u32, _width: u8) -> u32 {
+        // Diagnostic tap (armed only by the `disc` stall report): histogram which register is read.
+        if let Some(m) = self.io_trace.borrow_mut().as_mut() {
+            *m.entry(offset).or_insert(0) += 1;
+        }
         match offset {
             0x000..=0x05F => self.mem_control[(offset >> 2) as usize], // memory-control 1
             0x060 => self.mem_control[0x18], // RAM_SIZE
@@ -443,6 +455,27 @@ impl Bus {
             0x814 => self.gpu.gp1(val),
             0xC00..=0xFFF => {} // SPU
             _ => {}
+        }
+    }
+
+    /// Human label for an I/O register offset (offset = phys - 0x1F801000), for the stall diagnosis.
+    /// Mirrors the `io_read` dispatch so a histogram entry reads as "0xDAE (SPU SPUSTAT)" rather than
+    /// a bare number. The named subset is the set a boot poll-wait plausibly spins on.
+    pub fn io_name(offset: u32) -> &'static str {
+        match offset {
+            0x070 => "I_STAT",
+            0x074 => "I_MASK",
+            0x0F0 | 0x0F4 => "DMA DICR",
+            0x080..=0x0FF => "DMA",
+            0x100..=0x12F => "TIMERx",
+            0x800..=0x803 => "CDROM",
+            0x810 => "GPUREAD",
+            0x814 => "GPUSTAT",
+            0xDAE => "SPU SPUSTAT",
+            0xD88..=0xD9F => "SPU voice key/flags",
+            0xDAA => "SPU control (SPUCNT)",
+            0xC00..=0xFFF => "SPU",
+            _ => "other",
         }
     }
 }

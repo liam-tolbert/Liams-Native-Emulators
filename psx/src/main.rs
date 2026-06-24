@@ -63,7 +63,8 @@ fn main() {
         eprintln!("  {me} selftest              run the built-in CPU self-test");
         eprintln!("  {me} <bios.bin> <game.exe>  sideload a PS-EXE, run to a verdict");
         eprintln!("  {me} <bios.bin> dump [N]    headless: run N frames -> VRAM PNG");
-        eprintln!("  {me} <bios.bin> disc <.cue>  boot a real disc off its image (HLE)");
+        eprintln!("  {me} <bios.bin> disc <.cue>         boot a real disc, headless, report the stall");
+        eprintln!("  {me} <bios.bin> disc <.cue> window  boot a real disc in a window (watch it render)");
         std::process::exit(1);
     }
 
@@ -124,7 +125,15 @@ fn main() {
             let frames = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(120);
             run_dump(&mut cpu, frames);
         }
-        Some("disc") => run_disc(&mut cpu, args.get(3).map(String::as_str)),
+        Some("disc") => {
+            // `disc <path>` runs headless to the stall report; `disc <path> window` opens a window.
+            let path = args.get(3).map(String::as_str);
+            if args.get(4).map(String::as_str) == Some("window") {
+                run_disc_window(&mut cpu, path);
+            } else {
+                run_disc(&mut cpu, path);
+            }
+        }
         Some(other) => {
             run_sideload(&mut cpu, other);
         }
@@ -685,12 +694,25 @@ fn print_diff(want: &[String], got: &[String]) {
 /// `disc` run-mode: attach a CD image, boot the BIOS to the hand-off, HLE-load the game's boot EXE off
 /// the disc, inject it, and run until it stalls — reporting where (the signal for the next milestone).
 fn run_disc(cpu: &mut Cpu, path_arg: Option<&str>) {
+    boot_disc(cpu, path_arg);
+    // Run the game's own code until it stalls, and report where (the M6-selecting signal).
+    let report = run_until_stall(cpu);
+    report.print(cpu);
+}
+
+/// The disc-boot preamble shared by the headless `disc` mode and the windowed `disc … window` mode:
+/// require a BIOS, resolve & attach the `.cue`, boot the real BIOS to the exec hand-off (so the kernel
+/// tables + a valid stack exist), HLE-load the game's boot EXE off the disc's ISO9660 filesystem, and
+/// inject it. On any failure it prints the reason and exits — the same contract `run_disc` had inline.
+/// On return the CPU is poised at the game's entry point, the disc still inserted for asset streaming;
+/// the two modes differ only in what they do next (report a stall vs. present frames).
+fn boot_disc(cpu: &mut Cpu, path_arg: Option<&str>) {
     if !cpu.bus.bios_loaded() {
         eprintln!("\n(disc boot needs a BIOS as the first argument — a 512 KiB image)");
         std::process::exit(1);
     }
     let path = path_arg.unwrap_or_else(|| {
-        eprintln!("\n(usage: <bios.bin> disc <path-to-.cue or game dir>)");
+        eprintln!("\n(usage: <bios.bin> disc <path-to-.cue or game dir> [window])");
         std::process::exit(1);
     });
 
@@ -735,10 +757,94 @@ fn run_disc(cpu: &mut Cpu, path_arg: Option<&str>) {
         exe.initial_gp,
         cpu.regs[29]
     );
+}
 
-    // 5. Run the game's own code until it stalls, and report where (the M6-selecting signal).
-    let report = run_until_stall(cpu);
-    report.print(cpu);
+/// `disc … window` run-mode: boot the disc exactly like `run_disc`, but instead of running headless to
+/// a stall, open a window and present the game's frames at ~60 Hz so we can *watch* the boot render
+/// before it parks. Crucially `bus.tick` advances the GPU's video clock every instruction, so VBlank
+/// keeps firing — and the window keeps refreshing — even after the game settles into its poll-wait; it
+/// simply shows the last frame the game drew. The full "what is it polling" diagnosis is the headless
+/// `disc` mode; here we only flag *when* it parks. View-only — PS1 controllers are a later milestone;
+/// Esc or closing the window quits. (Mirrors `run_window`, with the disc preamble in front.)
+fn run_disc_window(cpu: &mut Cpu, path_arg: Option<&str>) {
+    use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
+    use std::time::{Duration, Instant};
+
+    boot_disc(cpu, path_arg);
+    println!("[disc] opening a window — watch the boot render ([Esc] quits) ...\n");
+
+    let mut window = Window::new(
+        "PlayStation 1  —  disc  —  [Esc] to quit",
+        640,
+        480,
+        WindowOptions {
+            scale: Scale::X1,
+            scale_mode: ScaleMode::AspectRatioStretch,
+            ..WindowOptions::default()
+        },
+    )
+    .expect("failed to create window");
+
+    let frame_time = Duration::from_micros(16_666); // ~60 Hz, paced against the wall clock
+
+    // "It parked" watch — the same forward-progress idea the headless plateau watchdog uses (a tight
+    // poll loop cycles over several PCs, so a single-PC test would miss it): once the furthest RAM PC
+    // and the TTY both stop advancing for a long stretch, the game has reached its poll-wait. Note it
+    // once; the window stays live showing the last frame.
+    const PARK_LIMIT: u64 = 8_000_000;
+    let mut max_ram_pc = 0u32;
+    let mut plateau = 0u64;
+    let mut tty_len = cpu.bus.tty_out.len();
+    let mut noted = false;
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        let frame_start = Instant::now();
+
+        // Run one emulated frame: step until the GPU trips VBlank. The guard stops a wedged machine
+        // from freezing the window (normally it breaks the instant a frame completes).
+        let mut guard = 0u32;
+        while !cpu.bus.gpu.take_frame() {
+            cpu.step();
+
+            if !noted {
+                let pc = cpu.pc;
+                let in_ram = (0x8001_0000..0x8020_0000).contains(&pc);
+                let tty_now = cpu.bus.tty_out.len();
+                if (in_ram && pc > max_ram_pc) || tty_now != tty_len {
+                    if in_ram && pc > max_ram_pc {
+                        max_ram_pc = pc;
+                    }
+                    tty_len = tty_now;
+                    plateau = 0;
+                } else {
+                    plateau += 1;
+                    if plateau > PARK_LIMIT {
+                        noted = true;
+                        println!(
+                            "\n[disc] poll-wait reached (furthest RAM pc 0x{max_ram_pc:08X}); the window \
+                             stays open showing the last frame. Run the headless `disc` mode for the full \
+                             diagnosis of what it's waiting on.\n"
+                        );
+                    }
+                }
+            }
+
+            guard += 1;
+            if guard > 5_000_000 {
+                break;
+            }
+        }
+
+        let (w, h, buf) = cpu.bus.gpu.display_frame();
+        window
+            .update_with_buffer(&buf, w, h)
+            .expect("failed to update window");
+
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_time {
+            std::thread::sleep(frame_time - elapsed);
+        }
+    }
 }
 
 /// Walk the attached disc's ISO9660 filesystem to find SYSTEM.CNF, read the `BOOT=` executable name,
@@ -800,13 +906,23 @@ fn resolve_cue(path: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// The result of sampling a detected poll-wait with the MMIO-read tap armed: which register(s) the
+/// loop spins on. `top` is the hottest I/O offset (`phys - 0x1F801000`), or `None` when the loop read
+/// no device port at all in the sample window (i.e. it polls a RAM/kernel variable — a missed IRQ).
+struct PollDiag {
+    summary: String,
+    top: Option<u32>,
+}
+
 /// Why the post-boot run stopped — the signal that picks the next milestone. `pc`/`instr` name the
-/// instruction the report is about (the faulting one for a fault loop, not the handler).
+/// instruction the report is about (the faulting one for a fault loop, not the handler). `poll` is
+/// present only for the poll-wait stops, carrying the diagnosis of what the loop is waiting on.
 struct StallReport {
     pc: u32,
     instr: u32,
     reason: String,
     steps: u64,
+    poll: Option<PollDiag>,
 }
 
 impl StallReport {
@@ -819,6 +935,26 @@ impl StallReport {
             "[disc] STALL @ pc=0x{:08X}  instr=0x{:08X}  — {}",
             self.pc, self.instr, self.reason
         );
+
+        // For a poll-wait, the headline of this stage: *what* is it waiting on, plus the interrupt
+        // state that tells "polling a stubbed device" apart from "waiting on an IRQ that never comes".
+        if let Some(diag) = &self.poll {
+            println!("[disc] poll target: {}", diag.summary);
+            let stat = cpu.bus.irq.read_stat();
+            let mask = cpu.bus.irq.read_mask();
+            let sr = cpu.cop0.sr;
+            let cause = cpu.cop0.cause;
+            println!(
+                "[disc] IRQ state: I_STAT=0x{stat:04X} I_MASK=0x{mask:04X} enabled&pending=0x{:04X}  \
+                 SR=0x{sr:08X} (IEc={}, IM=0x{:02X})  CAUSE=0x{cause:08X} (IP=0x{:02X})",
+                stat & mask,
+                sr & 1,
+                (sr >> 8) & 0xFF,
+                (cause >> 8) & 0xFF,
+            );
+            println!("[disc] suggested next: {}", poll_verdict(diag.top));
+        }
+
         let tty = cpu.bus.tty_out.trim_end();
         if !tty.is_empty() {
             let lines: Vec<&str> = tty.lines().collect();
@@ -826,6 +962,86 @@ impl StallReport {
             println!("----- last TTY -----\n{}\n--------------------", lines[start..].join("\n"));
         }
         dump_regs(cpu);
+    }
+}
+
+/// Once a poll-wait is detected, run a short window with the MMIO-read tap armed and tally which I/O
+/// register(s) the loop reads. The hottest is what it is spinning on. This is the concrete, recorded
+/// signal that orders the next milestone — it turns "stuck somewhere" into "polling 0x1F801DAE".
+fn diagnose_poll(cpu: &mut Cpu) -> PollDiag {
+    // Generous so even a poll loop that calls deep into the BIOS each pass (few iterations per 100k
+    // instrs) still tallies its target many times. We've already spent ~24M of the 50M budget getting
+    // here; a 1M-instruction diagnostic sample is cheap and one-time.
+    const SAMPLE: u64 = 1_000_000;
+    *cpu.bus.io_trace.borrow_mut() = Some(std::collections::HashMap::new());
+    for _ in 0..SAMPLE {
+        cpu.step();
+    }
+    let hist = cpu.bus.io_trace.borrow_mut().take().unwrap_or_default();
+
+    let mut entries: Vec<(u32, u64)> = hist.into_iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    if entries.is_empty() {
+        return PollDiag {
+            summary: format!(
+                "no I/O register read in {SAMPLE} sampled instructions — the loop polls a RAM/kernel \
+                 variable, not a device port (it is waiting for an interrupt handler to update it)"
+            ),
+            top: None,
+        };
+    }
+    let parts: Vec<String> = entries
+        .iter()
+        .take(3)
+        .map(|(off, n)| format!("0x{:08X} ({}) x{n}", 0x1F80_1000 + off, Bus::io_name(*off)))
+        .collect();
+    PollDiag {
+        summary: format!("over {SAMPLE} sampled instructions the loop polls {}", parts.join(", ")),
+        top: entries.first().map(|(off, _)| *off),
+    }
+}
+
+/// Turn the hottest polled register into a one-line "build this next" recommendation. Diagnose-only —
+/// this is text, not a fix. The arms cover the realistic boot walls; the key distinction is between a
+/// *stubbed* device (implement it) and an *implemented* one whose behaviour doesn't yet match what the
+/// game waits for (reconcile the timing/semantics — not a new subsystem).
+fn poll_verdict(top: Option<u32>) -> &'static str {
+    match top {
+        // No device read at all: the loop spins on a RAM word a BIOS interrupt handler should bump.
+        None => "the loop waits on a memory variable, not a device — check the IRQ state above: if \
+                 the expected source (VBlank bit 0 / CD bit 2) is masked in I_MASK/SR.IM or SR.IEc=0, \
+                 this is an interrupt-delivery gap to close; otherwise trace which BIOS event it set up",
+        // Root counters (Timer0/1/2) — IMPLEMENTED, so this is a frame-pacing/timer mismatch, not a
+        // missing device. The PS1's common software VSync waits on Timer1 (hblank/vblank-synced).
+        Some(o) if (0x100..=0x12F).contains(&o) => {
+            "frame-timing wait on a root counter (Timer0/1/2) — those ARE implemented, so this is not a \
+             missing device: the game paces on timer counts/targets that our coarse 2-cycles-per- \
+             instruction model produces differently than hardware. THE M6 DRIVER: reconcile the polled \
+             timer's mode/target + its vblank/hblank-sync cadence (and GPUSTAT, also polled) with the \
+             game's frame-sync — this is GPU/timer timing, not GTE and not the SPU"
+        }
+        // GPU status — a vblank / draw-ready wait; the bits are assembled live from our video clock.
+        Some(0x810) | Some(0x814) => {
+            "GPU-status / VSync wait (GPUREAD/GPUSTAT) — GPUSTAT is implemented; verify its timing bits \
+             (vblank, even/odd field, DMA/cmd-ready) toggle under our video clock as the game expects"
+        }
+        // The SPU register block — audio-init readiness.
+        Some(o) if (0xC00..=0xFFF).contains(&o) => {
+            "SPU init poll — pull a minimal SPU status/control stub forward (part of M8) so the \
+             readiness bit the loop waits on reads as ready"
+        }
+        // I_STAT/I_MASK — it's interrupt-driven; confirm the source is enabled and actually raised.
+        Some(0x070) | Some(0x074) => {
+            "interrupt-driven wait on I_STAT — confirm the awaited source is unmasked (I_MASK & SR.IM) \
+             and is being raised; if so this is an IRQ-delivery gap, not a missing device"
+        }
+        // The CD-ROM controller ports — a response/sector INT isn't arriving.
+        Some(o) if (0x800..=0x803).contains(&o) => {
+            "CD-event wait — the loop polls the CD-ROM controller; the next response/sector interrupt \
+             isn't arriving (check the ack-gated event queue)"
+        }
+        Some(_) => "polls a device port — inspect that register's status/ready semantics (and whether \
+                    the game is also waiting on an interrupt that isn't arriving)",
     }
 }
 
@@ -877,6 +1093,7 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
                 instr: 0,
                 reason: "returned to the null sentinel (program exited / jumped to 0)".into(),
                 steps: i,
+                poll: None,
             };
         }
 
@@ -889,7 +1106,7 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
             _ => None,
         };
         if let Some(reason) = gte {
-            return StallReport { pc, instr, reason: reason.into(), steps: i };
+            return StallReport { pc, instr, reason: reason.into(), steps: i, poll: None };
         }
 
         // A PC that stops advancing is a spin-wait on something that never changes (a poll loop).
@@ -900,11 +1117,13 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
             last_pc = pc;
         }
         if same_pc > SPIN_LIMIT {
+            let poll = diagnose_poll(cpu); // tap the MMIO reads to name what the loop spins on
             return StallReport {
                 pc,
                 instr,
-                reason: "spinning on one PC (a poll wait — likely the stubbed SPU or a CD wait)".into(),
+                reason: "spinning on one PC (a poll wait)".into(),
                 steps: i,
+                poll: Some(poll),
             };
         }
 
@@ -924,6 +1143,7 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
         } else {
             plateau += 1;
             if plateau > PLATEAU_LIMIT {
+                let poll = diagnose_poll(cpu); // tap the MMIO reads to name what the loop spins on
                 return StallReport {
                     pc,
                     instr,
@@ -931,6 +1151,7 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
                         "no new RAM code or TTY for >{PLATEAU_LIMIT} instrs (furthest reached 0x{max_ram_pc:08X}) — a poll wait on hardware we don't drive yet"
                     ),
                     steps: i,
+                    poll: Some(poll),
                 };
             }
         }
@@ -957,6 +1178,7 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
                         exc_name(code)
                     ),
                     steps: i,
+                    poll: None,
                 };
             }
         }
@@ -966,6 +1188,7 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
         instr: cpu.bus.read32(cpu.pc),
         reason: "instruction budget exhausted (no obvious stall — may still be running)".into(),
         steps: RUN_BUDGET,
+        poll: None,
     }
 }
 

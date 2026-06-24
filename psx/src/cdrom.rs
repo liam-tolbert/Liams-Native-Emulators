@@ -459,6 +459,14 @@ enum Backing {
 pub struct CdImage {
     backing: Backing,
     sector_count: usize,
+    /// A one-sector read cache: the last `(lba, raw 2352-byte sector)` returned by `read_sector`.
+    /// The win is the streamed `File` backing — re-reading the same sector (the host-side ISO9660 walk
+    /// hits the PVD/root repeatedly, and a streaming game often re-touches a sector) skips a `seek` +
+    /// `read_exact` on the 408 MiB `.bin`. It is correctness-neutral for the `Memory` backing (already
+    /// a slice copy). Behind a `RefCell` because `read_sector` is on the drive's `&self` read path —
+    /// the same "a read that mutates" wrinkle the `File` handle and the FIFOs have. No stale-disc
+    /// hazard: `load_disc` swaps the whole `CdImage`, so the cache can't outlive its disc.
+    cache: RefCell<Option<(u32, [u8; SECTOR_RAW_LEN])>>,
 }
 
 impl CdImage {
@@ -469,6 +477,7 @@ impl CdImage {
         Self {
             backing: Backing::Memory(bytes),
             sector_count,
+            cache: RefCell::new(None),
         }
     }
 
@@ -502,13 +511,24 @@ impl CdImage {
         Ok(Self {
             backing: Backing::File(RefCell::new(file)),
             sector_count,
+            cache: RefCell::new(None),
         })
     }
 
     /// Read one raw 2352-byte sector by LBA. Past the end of the disc it reads as zeros (a malformed
     /// pointer shouldn't panic the emulator). A memory image copies the slice; a file image seeks to
     /// the sector and reads it — `read_exact` leaves the tail zeroed for a short final sector.
+    ///
+    /// A one-sector cache short-circuits a repeat of the *same* LBA: the ISO9660 host-walk re-reads
+    /// the PVD/root, and a streaming game re-touches sectors, so this skips a `seek` + `read_exact` on
+    /// the 408 MiB `.bin`. The cached bytes are exactly what the backing would return (including the
+    /// past-end zeros), so the cache is correctness-neutral — it only removes file I/O.
     pub fn read_sector(&self, lba: u32) -> [u8; SECTOR_RAW_LEN] {
+        if let Some((cached_lba, sector)) = self.cache.borrow().as_ref() {
+            if *cached_lba == lba {
+                return *sector;
+            }
+        }
         let mut out = [0u8; SECTOR_RAW_LEN];
         let off = lba as usize * SECTOR_RAW_LEN;
         match &self.backing {
@@ -526,6 +546,7 @@ impl CdImage {
                 }
             }
         }
+        *self.cache.borrow_mut() = Some((lba, out));
         out
     }
 
