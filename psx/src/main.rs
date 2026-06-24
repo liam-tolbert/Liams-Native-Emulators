@@ -912,6 +912,10 @@ fn resolve_cue(path: &str) -> Option<std::path::PathBuf> {
 struct PollDiag {
     summary: String,
     top: Option<u32>,
+    /// [TEMP M6] extra diagnostic lines: per-offset reader PC + value range, interrupts taken during
+    /// the sample, the timer state the game programmed, and a disassembly of the loop. Removed with the
+    /// scaffolding once the bug is fixed.
+    details: Vec<String>,
 }
 
 /// Why the post-boot run stopped — the signal that picks the next milestone. `pc`/`instr` name the
@@ -953,6 +957,11 @@ impl StallReport {
                 (cause >> 8) & 0xFF,
             );
             println!("[disc] suggested next: {}", poll_verdict(diag.top));
+            // [TEMP M6] the deep diagnostic detail — what each polled register reads, whether the
+            // VBlank handler runs, how the timer is programmed, and the loop disassembly.
+            for line in &diag.details {
+                println!("[disc] {line}");
+            }
         }
 
         let tty = cpu.bus.tty_out.trim_end();
@@ -968,19 +977,128 @@ impl StallReport {
 /// Once a poll-wait is detected, run a short window with the MMIO-read tap armed and tally which I/O
 /// register(s) the loop reads. The hottest is what it is spinning on. This is the concrete, recorded
 /// signal that orders the next milestone — it turns "stuck somewhere" into "polling 0x1F801DAE".
+///
+/// [TEMP M6] beyond the count, it now also captures the reading PC + value range per register, the
+/// interrupts actually taken during the loop, the timer programming, and a disassembly of the loop —
+/// all to pin the exact frame-sync predicate. This extra detail (and `PollDiag::details`) is removed
+/// with the rest of the M6 scaffolding once the fix lands.
 fn diagnose_poll(cpu: &mut Cpu) -> PollDiag {
     // Generous so even a poll loop that calls deep into the BIOS each pass (few iterations per 100k
     // instrs) still tallies its target many times. We've already spent ~24M of the 50M budget getting
     // here; a 1M-instruction diagnostic sample is cheap and one-time.
     const SAMPLE: u64 = 1_000_000;
+    let parked_pc = cpu.pc;
     *cpu.bus.io_trace.borrow_mut() = Some(std::collections::HashMap::new());
+    cpu.diag_irq = [0; 16];
+    // [TEMP M6] last-exception context captured *before* the sample perturbs it: for a frozen /
+    // BIOS-SystemError hang, CAUSE.ExcCode + EPC name the instruction that actually faulted.
+    let exc_code = (cpu.cop0.cause >> 2) & 0x1F;
+    let epc = cpu.cop0.epc;
+    let epc_instr = cpu.bus.read32(epc);
+    // [TEMP M6] MvC's outer loop waits on the frame counter at 0x8001E214 (getCount(-1) returns it);
+    // sample it across the window to see whether the VBlank handler is actually advancing it.
+    let fc_before = cpu.bus.read32(0x8001_E214);
     for _ in 0..SAMPLE {
         cpu.step();
     }
+    let fc_after = cpu.bus.read32(0x8001_E214);
     let hist = cpu.bus.io_trace.borrow_mut().take().unwrap_or_default();
 
-    let mut entries: Vec<(u32, u64)> = hist.into_iter().collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut entries: Vec<(u32, crate::bus::IoTap)> = hist.into_iter().collect();
+    entries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(&b.0)));
+
+    // [TEMP M6] assemble the deep detail lines.
+    let mut details = Vec::new();
+    for (off, tap) in entries.iter().take(4) {
+        let state = if tap.min_val == tap.max_val { "STUCK" } else { "changing" };
+        details.push(format!(
+            "read 0x{:08X} ({:<14}) x{:<8} by pc=0x{:08X}  val {:08X}..{:08X} last={:08X} [{state}]",
+            0x1F80_1000 + off,
+            Bus::io_name(*off),
+            tap.count,
+            tap.last_pc,
+            tap.min_val,
+            tap.max_val,
+            tap.last_val,
+        ));
+    }
+    details.push(format!(
+        "last exception: ExcCode=0x{exc_code:02X} ({}) EPC=0x{epc:08X} instr@EPC=0x{epc_instr:08X}",
+        exc_name(exc_code)
+    ));
+    if epc != 0 {
+        details.push(format!("disasm @ EPC 0x{epc:08X} (the faulting instruction):"));
+        for line in disasm(cpu, epc.wrapping_sub(0x10), 9) {
+            details.push(format!("  {line}"));
+        }
+    }
+    let irq_total: u64 = cpu.diag_irq.iter().sum();
+    let irq_parts: Vec<String> = (0..16)
+        .filter(|&b| cpu.diag_irq[b] > 0)
+        .map(|b| format!("{}={}x", irq_src_name(b), cpu.diag_irq[b]))
+        .collect();
+    details.push(format!(
+        "IRQs taken during sample: total={irq_total} [{}] — {}",
+        irq_parts.join(" "),
+        if irq_total == 0 {
+            "the BIOS interrupt handler is NOT entered during the loop"
+        } else {
+            "the handler IS entered (so the wait is on a flag/value it doesn't update)"
+        }
+    ));
+    for n in 0..3 {
+        let (val, mode, target) = cpu.bus.timers.diag_snapshot(n);
+        let src = (mode >> 8) & 3;
+        let sync = if mode & 1 != 0 {
+            ((mode >> 1) & 3).to_string()
+        } else {
+            "off".into()
+        };
+        details.push(format!(
+            "TIMER{n} value=0x{val:04X} target=0x{target:04X} mode=0x{mode:04X} (src={src} reset_on_target={} sync={sync})",
+            (mode >> 3) & 1,
+        ));
+    }
+    // Disassemble the loop: around the parked PC, the live PC, the caller (ra = the outer waiter),
+    // and each hottest reader.
+    details.push(format!("disasm @ parked pc 0x{parked_pc:08X}:"));
+    for line in disasm(cpu, parked_pc.wrapping_sub(0x20), 14) {
+        details.push(format!("  {line}"));
+    }
+    details.push(format!("disasm @ live pc 0x{:08X}:", cpu.pc));
+    for line in disasm(cpu, cpu.pc.wrapping_sub(0x20), 16) {
+        details.push(format!("  {line}"));
+    }
+    details.push(format!("disasm @ caller ra=0x{:08X} (the outer waiter):", cpu.regs[31]));
+    for line in disasm(cpu, cpu.regs[31].wrapping_sub(0x2C), 22) {
+        details.push(format!("  {line}"));
+    }
+    if let Some((_, tap)) = entries.first() {
+        // Wide window so it covers the whole count function the readers live in (how the count the
+        // outer loop waits on is computed).
+        details.push(format!("disasm @ count function near pc 0x{:08X}:", tap.last_pc));
+        for line in disasm(cpu, tap.last_pc.wrapping_sub(0x28), 76) {
+            details.push(format!("  {line}"));
+        }
+    }
+    details.push(format!(
+        "frame counter *0x8001E214: before=0x{fc_before:08X} after=0x{fc_after:08X} (delta {}) — {}",
+        fc_after.wrapping_sub(fc_before),
+        if fc_after == fc_before {
+            "NOT advancing → the VBlank handler isn't incrementing it (the bug)"
+        } else {
+            "advancing → this is a long legitimate wait, not a hang"
+        }
+    ));
+    // [TEMP M6] dump the globals the outer waiter compares (target/accumulator) + the field cache.
+    for base in [0x8002_04A0u32, 0x8001_D0E0] {
+        let mut row = format!("ram 0x{base:08X}:");
+        for k in 0..6 {
+            row.push_str(&format!(" {:08X}", cpu.bus.read32(base + k * 4)));
+        }
+        details.push(row);
+    }
+
     if entries.is_empty() {
         return PollDiag {
             summary: format!(
@@ -988,16 +1106,114 @@ fn diagnose_poll(cpu: &mut Cpu) -> PollDiag {
                  variable, not a device port (it is waiting for an interrupt handler to update it)"
             ),
             top: None,
+            details,
         };
     }
     let parts: Vec<String> = entries
         .iter()
         .take(3)
-        .map(|(off, n)| format!("0x{:08X} ({}) x{n}", 0x1F80_1000 + off, Bus::io_name(*off)))
+        .map(|(off, tap)| format!("0x{:08X} ({}) x{}", 0x1F80_1000 + off, Bus::io_name(*off), tap.count))
         .collect();
     PollDiag {
         summary: format!("over {SAMPLE} sampled instructions the loop polls {}", parts.join(", ")),
         top: entries.first().map(|(off, _)| *off),
+        details,
+    }
+}
+
+/// [TEMP M6 scaffolding] short name for an I_STAT source bit, for the interrupts-taken tally.
+fn irq_src_name(bit: usize) -> &'static str {
+    match bit {
+        0 => "VBLANK",
+        1 => "GPU",
+        2 => "CDROM",
+        3 => "DMA",
+        4 => "TMR0",
+        5 => "TMR1",
+        6 => "TMR2",
+        7 => "PAD",
+        _ => "?",
+    }
+}
+
+/// [TEMP M6 scaffolding] a tiny MIPS-I disassembler — just the common ops, enough to read a poll-loop
+/// predicate (loads, the lui/ori address build, the and/compare, and the branch that closes the loop).
+/// Reads straight from RAM through the bus. Removed with the rest of the scaffolding once the fix lands.
+fn disasm(cpu: &Cpu, start: u32, n: u32) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            let pc = start.wrapping_add(i * 4);
+            let w = cpu.bus.read32(pc);
+            format!("0x{pc:08X}: {w:08X}  {}", decode_mips(w, pc))
+        })
+        .collect()
+}
+
+fn decode_mips(w: u32, pc: u32) -> String {
+    let op = w >> 26;
+    let rs = ((w >> 21) & 0x1F) as usize;
+    let rt = ((w >> 16) & 0x1F) as usize;
+    let rd = ((w >> 11) & 0x1F) as usize;
+    let sh = (w >> 6) & 0x1F;
+    let funct = w & 0x3F;
+    let imm = (w & 0xFFFF) as i16 as i32;
+    let immu = w & 0xFFFF;
+    let r = |i: usize| REG_NAMES[i];
+    let btgt = pc.wrapping_add(4).wrapping_add((imm as u32) << 2);
+    let jtgt = (pc & 0xF000_0000) | ((w & 0x03FF_FFFF) << 2);
+    match op {
+        0x00 => match funct {
+            0x00 if w == 0 => "nop".into(),
+            0x00 => format!("sll {},{},{sh}", r(rd), r(rt)),
+            0x02 => format!("srl {},{},{sh}", r(rd), r(rt)),
+            0x03 => format!("sra {},{},{sh}", r(rd), r(rt)),
+            0x04 => format!("sllv {},{},{}", r(rd), r(rt), r(rs)),
+            0x06 => format!("srlv {},{},{}", r(rd), r(rt), r(rs)),
+            0x08 => format!("jr {}", r(rs)),
+            0x09 => format!("jalr {},{}", r(rd), r(rs)),
+            0x10 => format!("mfhi {}", r(rd)),
+            0x12 => format!("mflo {}", r(rd)),
+            0x18 => format!("mult {},{}", r(rs), r(rt)),
+            0x1A => format!("div {},{}", r(rs), r(rt)),
+            0x1B => format!("divu {},{}", r(rs), r(rt)),
+            0x20 => format!("add {},{},{}", r(rd), r(rs), r(rt)),
+            0x21 => format!("addu {},{},{}", r(rd), r(rs), r(rt)),
+            0x22 => format!("sub {},{},{}", r(rd), r(rs), r(rt)),
+            0x23 => format!("subu {},{},{}", r(rd), r(rs), r(rt)),
+            0x24 => format!("and {},{},{}", r(rd), r(rs), r(rt)),
+            0x25 => format!("or {},{},{}", r(rd), r(rs), r(rt)),
+            0x26 => format!("xor {},{},{}", r(rd), r(rs), r(rt)),
+            0x27 => format!("nor {},{},{}", r(rd), r(rs), r(rt)),
+            0x2A => format!("slt {},{},{}", r(rd), r(rs), r(rt)),
+            0x2B => format!("sltu {},{},{}", r(rd), r(rs), r(rt)),
+            _ => format!("special funct=0x{funct:02X}"),
+        },
+        0x01 => format!("bcond {},0x{btgt:08X}", r(rs)),
+        0x02 => format!("j 0x{jtgt:08X}"),
+        0x03 => format!("jal 0x{jtgt:08X}"),
+        0x04 => format!("beq {},{},0x{btgt:08X}", r(rs), r(rt)),
+        0x05 => format!("bne {},{},0x{btgt:08X}", r(rs), r(rt)),
+        0x06 => format!("blez {},0x{btgt:08X}", r(rs)),
+        0x07 => format!("bgtz {},0x{btgt:08X}", r(rs)),
+        0x08 => format!("addi {},{},{imm}", r(rt), r(rs)),
+        0x09 => format!("addiu {},{},{imm}", r(rt), r(rs)),
+        0x0A => format!("slti {},{},{imm}", r(rt), r(rs)),
+        0x0B => format!("sltiu {},{},{imm}", r(rt), r(rs)),
+        0x0C => format!("andi {},{},0x{immu:04X}", r(rt), r(rs)),
+        0x0D => format!("ori {},{},0x{immu:04X}", r(rt), r(rs)),
+        0x0E => format!("xori {},{},0x{immu:04X}", r(rt), r(rs)),
+        0x0F => format!("lui {},0x{immu:04X}", r(rt)),
+        0x10 => format!("cop0 0x{:07X}", w & 0x01FF_FFFF),
+        0x12 => format!("cop2/GTE 0x{:07X}", w & 0x01FF_FFFF),
+        0x20 => format!("lb {},{imm}({})", r(rt), r(rs)),
+        0x21 => format!("lh {},{imm}({})", r(rt), r(rs)),
+        0x23 => format!("lw {},{imm}({})", r(rt), r(rs)),
+        0x24 => format!("lbu {},{imm}({})", r(rt), r(rs)),
+        0x25 => format!("lhu {},{imm}({})", r(rt), r(rs)),
+        0x28 => format!("sb {},{imm}({})", r(rt), r(rs)),
+        0x29 => format!("sh {},{imm}({})", r(rt), r(rs)),
+        0x2B => format!("sw {},{imm}({})", r(rt), r(rs)),
+        _ => format!("op=0x{op:02X}"),
     }
 }
 
@@ -1062,31 +1278,35 @@ fn exc_name(code: u32) -> &'static str {
     }
 }
 
-/// Step the injected game until it stops making forward progress, classifying *why* — the whole point
-/// of this stage is to learn where the game's own code first needs hardware we haven't built.
+/// Step the injected game until it hits a *real* wall, classifying why.
 ///
-/// Exceptions are NORMAL here: the game makes BIOS syscalls, and each one transiently lands at the
-/// exception vector before the real kernel handler returns via RFE — so a single visit to 0x80000080
-/// is *not* a stall. We only flag a fault that *repeats on the same EPC*, which means the handler
-/// keeps returning to an instruction that immediately re-faults (an op or feature we don't emulate).
-/// Stops on the first of: the null sentinel (exit); an un-emulated GTE/COP2 instruction at PC (the
-/// expected first wall — M6 — caught *before* it runs so we name it); a single PC spinning (a poll
-/// wait on a device that never changes, e.g. the stubbed SPU); a repeated same-EPC fault (reported
-/// with its cause); or the instruction budget.
+/// The load-bearing discipline (learned the hard way): **a machine still taking interrupts is alive,
+/// not hung.** MvC's boot spends a ~960-frame timed delay (hundreds of millions of instructions) parked
+/// in a tiny loop whose only forward progress is a frame counter the VBlank handler bumps — there is no
+/// new code and no TTY for that whole stretch, yet it is perfectly healthy. So we do NOT treat a code/TTY
+/// plateau as a stall on its own; we only flag a machine that is *frozen* — no new code, no TTY, AND no
+/// interrupt taken for a long stretch (interrupts off, or genuinely wedged). The two hard walls — an
+/// un-emulated GTE/COP2 op, and a fault that repeats on the same EPC — are caught immediately regardless,
+/// since those are the real "we don't emulate this yet" signals. Exceptions are otherwise NORMAL (every
+/// BIOS syscall transiently lands at 0x80000080 before the handler returns via RFE).
 fn run_until_stall(cpu: &mut Cpu) -> StallReport {
-    const SPIN_LIMIT: u64 = 2_000_000; // the same PC this many steps == a spin/poll wait
+    // Generous: must outlast realistic multi-second timed waits (≈282k instrs/frame, so ~960 frames is
+    // ~270M instrs) so we run *past* them to the real wall rather than mistaking the wait for a stall.
+    const DISC_BUDGET: u64 = 600_000_000;
     const FAULT_LIMIT: u64 = 2_048; // the same instruction faulting this many times == stuck
-    const PLATEAU_LIMIT: u64 = 24_000_000; // no new RAM code + no TTY this long == stuck looping
-    let mut last_pc = cpu.pc;
-    let mut same_pc = 0u64;
+    // No new code, no new TTY, AND no interrupt taken for this long == frozen (a live machine waiting on
+    // VBlank trips its interrupt every ~282k instrs, far under this, so a healthy wait never frozes out).
+    const FROZEN_LIMIT: u64 = 4_000_000;
     let mut fault_epc = u32::MAX;
     let mut fault_reps = 0u64;
     let mut max_ram_pc = 0u32;
-    let mut plateau = 0u64;
+    let mut frozen = 0u64;
     let mut tty_len = cpu.bus.tty_out.len();
-    for i in 0..RUN_BUDGET {
+    let mut last_irq = cpu.irq_taken;
+    for i in 0..DISC_BUDGET {
         let pc = cpu.pc;
 
+        // STOP 1: null sentinel (the injected program returned / jumped to 0).
         if pc == SENTINEL_RA {
             return StallReport {
                 pc,
@@ -1097,58 +1317,41 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
             };
         }
 
-        // An un-emulated GTE/COP2 op is the wall we expect to hit first; catch it before it runs.
+        // STOP 2: an un-emulated GTE/COP2 op — the real next wall; caught before it runs so we name it.
         let instr = cpu.bus.read32(pc);
         let gte = match instr >> 26 {
-            0x12 => Some("un-emulated COP2/GTE instruction — selects M6 (the GTE)"),
-            0x32 => Some("un-emulated LWC2 (GTE load) — selects M6 (the GTE)"),
-            0x3A => Some("un-emulated SWC2 (GTE store) — selects M6 (the GTE)"),
+            0x12 => Some("un-emulated COP2/GTE instruction — selects the GTE (COP2) milestone"),
+            0x32 => Some("un-emulated LWC2 (GTE load) — selects the GTE (COP2) milestone"),
+            0x3A => Some("un-emulated SWC2 (GTE store) — selects the GTE (COP2) milestone"),
             _ => None,
         };
         if let Some(reason) = gte {
             return StallReport { pc, instr, reason: reason.into(), steps: i, poll: None };
         }
 
-        // A PC that stops advancing is a spin-wait on something that never changes (a poll loop).
-        if pc == last_pc {
-            same_pc += 1;
-        } else {
-            same_pc = 0;
-            last_pc = pc;
-        }
-        if same_pc > SPIN_LIMIT {
-            let poll = diagnose_poll(cpu); // tap the MMIO reads to name what the loop spins on
-            return StallReport {
-                pc,
-                instr,
-                reason: "spinning on one PC (a poll wait)".into(),
-                steps: i,
-                poll: Some(poll),
-            };
-        }
-
-        // Forward-progress watchdog: the highest PC reached *in the RAM code region* climbs while the
-        // game is still reaching new code and plateaus once it's stuck looping — even a loop that calls
-        // far into BIOS/kernel each pass, since those ROM addresses fall outside the window and are
-        // ignored. No new RAM code AND no new TTY for a long stretch == a poll wait on hardware we don't
-        // drive yet. (A productive init/memset reaches new code or prints again well within the limit.)
+        // Liveness: new RAM code, fresh TTY, OR an interrupt taken since the last step all count as
+        // "alive" and reset the frozen counter. Because a waiting-but-healthy machine keeps taking
+        // VBlank interrupts, a long timed wait stays alive here and never trips the frozen stall — only
+        // a wedged machine (interrupts off / no progress at all) accumulates to the limit.
         let in_ram_code = (0x8001_0000..0x8020_0000).contains(&pc);
         let tty_now = cpu.bus.tty_out.len();
-        if (in_ram_code && pc > max_ram_pc) || tty_now != tty_len {
+        let alive = (in_ram_code && pc > max_ram_pc) || tty_now != tty_len || cpu.irq_taken != last_irq;
+        if alive {
             if in_ram_code && pc > max_ram_pc {
                 max_ram_pc = pc;
             }
             tty_len = tty_now;
-            plateau = 0;
+            last_irq = cpu.irq_taken;
+            frozen = 0;
         } else {
-            plateau += 1;
-            if plateau > PLATEAU_LIMIT {
+            frozen += 1;
+            if frozen > FROZEN_LIMIT {
                 let poll = diagnose_poll(cpu); // tap the MMIO reads to name what the loop spins on
                 return StallReport {
                     pc,
                     instr,
                     reason: format!(
-                        "no new RAM code or TTY for >{PLATEAU_LIMIT} instrs (furthest reached 0x{max_ram_pc:08X}) — a poll wait on hardware we don't drive yet"
+                        "frozen: no new code, TTY, or interrupt for >{FROZEN_LIMIT} instrs (furthest reached 0x{max_ram_pc:08X}) — a hard hang (interrupts disabled, or wedged waiting on a device that never fires)"
                     ),
                     steps: i,
                     poll: Some(poll),
@@ -1158,8 +1361,8 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
 
         cpu.step();
 
-        // A fault that keeps re-firing on the same EPC is unrecoverable: the handler returns and the
-        // game immediately re-faults on something we don't handle. Report the faulting instruction.
+        // STOP 4: a fault that keeps re-firing on the same EPC is unrecoverable: the handler returns and
+        // the game immediately re-faults on something we don't handle. Report the faulting instruction.
         if cpu.pc == 0x8000_0080 {
             let epc = cpu.cop0.epc;
             if epc == fault_epc {
@@ -1183,12 +1386,17 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
             }
         }
     }
+    // Budget exhausted while still alive: most likely an extremely long wait, or a wait on an event we
+    // never deliver. Diagnose what it polls so we can tell which.
+    let poll = diagnose_poll(cpu);
     StallReport {
         pc: cpu.pc,
         instr: cpu.bus.read32(cpu.pc),
-        reason: "instruction budget exhausted (no obvious stall — may still be running)".into(),
-        steps: RUN_BUDGET,
-        poll: None,
+        reason: format!(
+            "ran the full {DISC_BUDGET}-instruction budget without a hard wall (furthest reached 0x{max_ram_pc:08X}) — still alive; an extremely long wait or an event we never deliver"
+        ),
+        steps: DISC_BUDGET,
+        poll: Some(poll),
     }
 }
 

@@ -69,6 +69,17 @@ pub struct Cpu {
     /// never call the BIOS), so the tap costs nothing there. See the snoop in `step()`.
     pub capture_tty: bool,
 
+    /// Total hardware interrupts *taken* (exceptions vectored for an enabled IRQ) since reset. The
+    /// `disc` watchdog uses this as a liveness signal: a machine still taking VBlank interrupts is
+    /// alive and merely *waiting* (e.g. a game's multi-second frame-counter delay), not hung — so it
+    /// must not be misreported as a stall. Cheap (one add per interrupt).
+    pub irq_taken: u64,
+
+    /// [TEMP M6 scaffolding] per-source tally of hardware interrupts actually *taken*, indexed by
+    /// I_STAT bit (0=VBLANK … 6=TIMER2). Counted only while the diagnostic tap is armed; the `disc`
+    /// stall report reads it to answer "is the BIOS VBlank handler entered during the poll-wait?".
+    pub diag_irq: [u64; 16],
+
     /// The CPU owns the bus; every memory access goes through it.
     pub bus: Bus,
 }
@@ -91,6 +102,8 @@ impl Cpu {
             cycles: 0,
             cop0: Cop0::new(),
             capture_tty: false,
+            irq_taken: 0,
+            diag_irq: [0; 16],
             bus,
         }
     }
@@ -123,6 +136,8 @@ impl Cpu {
         self.current_pc = self.pc;
         self.delay_slot = self.branch;
         self.branch = false; // the instruction we run now may set it again
+
+        self.bus.cur_pc.set(self.current_pc); // [TEMP M6] let the &self io_read tap name the reader
 
         // ---- BIOS TTY tap ---------------------------------------------------------------
         // How does a PS1 program print text? There's no console by default, but the BIOS provides a
@@ -163,6 +178,17 @@ impl Cpu {
         self.cop0.set_hw_irq(self.bus.irq.pending());
 
         if self.cop0.irq_enabled() && self.cop0.interrupt_pending() {
+            self.irq_taken = self.irq_taken.wrapping_add(1); // liveness signal for the disc watchdog
+            // [TEMP M6] tally which enabled hardware sources were pending when we actually took the
+            // IRQ — this is how the stall report learns whether VBlank is being serviced in the loop.
+            if self.bus.io_trace.borrow().is_some() {
+                let pend = self.bus.irq.read_stat() & self.bus.irq.read_mask();
+                for b in 0..16 {
+                    if pend & (1 << b) != 0 {
+                        self.diag_irq[b] += 1;
+                    }
+                }
+            }
             // An interrupt is recognised *between* instructions: we take it now and do NOT run
             // the instruction we were about to fetch — it resumes later via EPC.
             self.exception(Exception::Interrupt);

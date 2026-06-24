@@ -265,6 +265,13 @@ impl Timers {
         fired
     }
 
+    /// [TEMP M6 scaffolding] read-only `(value, mode-config-bits, target)` snapshot of timer `n`, so
+    /// the `disc` stall report can show exactly how the game programmed the counter it polls.
+    pub fn diag_snapshot(&self, n: usize) -> (u16, u16, u16) {
+        let t = &self.ch[n];
+        (t.value, t.mode, t.target)
+    }
+
     /// Map a fired-mask bit back to its interrupt source constant — used by the bus to raise IRQs.
     pub fn irq_source(n: u8) -> u16 {
         [source::TIMER0, source::TIMER1, source::TIMER2][n as usize]

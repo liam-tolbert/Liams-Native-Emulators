@@ -58,6 +58,19 @@ enum Region {
     Unmapped,
 }
 
+/// [TEMP M6 scaffolding] one row of the diagnostic MMIO-read tap: how many times an I/O offset was
+/// read, the PC of the most recent reader, and the value range observed (min==max ⇒ the value never
+/// changed during the sample). Reverted to M5b-2's count-only tap once the frame-sync bug is fixed.
+#[derive(Clone, Copy, Default)]
+pub struct IoTap {
+    pub count: u64,
+    pub last_pc: u32,
+    pub first_val: u32,
+    pub last_val: u32,
+    pub min_val: u32,
+    pub max_val: u32,
+}
+
 pub struct Bus {
     // Heap-allocated (not `Box<[u8; N]>`) so building the bus never puts a 2 MiB array on
     // the stack — a real stack-overflow risk in unoptimised builds.
@@ -79,11 +92,15 @@ pub struct Bus {
     pub tty_out: String,
 
     /// A diagnostic MMIO-read tap, **off by default** (`None`). When armed (`Some(map)`), every
-    /// `io_read` bumps a histogram of `offset -> count`. The `disc` stall report arms it for a short
-    /// window once it has detected a poll-wait, so it can name *which* register the loop is spinning
-    /// on. Behind a `RefCell` because `io_read` is on the CPU's `&self` read path; left `None` it costs
-    /// the hot path a single `borrow`+`is_none` branch, so `cpu/cop` and the self-test are unaffected.
-    pub io_trace: std::cell::RefCell<Option<std::collections::HashMap<u32, u64>>>,
+    /// `io_read` records an `IoTap` per `offset` (count + reading PC + value range). The `disc` stall
+    /// report arms it for a short window once it has detected a poll-wait, so it can name *which*
+    /// register the loop spins on *and* what value it reads. Behind a `RefCell` because `io_read` is on
+    /// the CPU's `&self` read path; left `None` it costs the hot path a single `borrow`+`is_none`
+    /// branch, so `cpu/cop` and the self-test are unaffected. [TEMP M6 — count-only in M5b-2.]
+    pub io_trace: std::cell::RefCell<Option<std::collections::HashMap<u32, IoTap>>>,
+    /// [TEMP M6 scaffolding] the PC of the instruction currently executing, mirrored here by
+    /// `cpu.step()` so the `&self` `io_read` tap can record *which* instruction read a register.
+    pub cur_pc: std::cell::Cell<u32>,
 }
 
 impl Bus {
@@ -101,6 +118,7 @@ impl Bus {
             cache_control: 0,
             tty_out: String::new(),
             io_trace: std::cell::RefCell::new(None),
+            cur_pc: std::cell::Cell::new(0),
         }
     }
 
@@ -416,11 +434,7 @@ impl Bus {
     // here rather than whatever the hardware floats. None of that matters to the BIOS boot or the
     // amidog CPU tests, so it's deferred until a test ROM actually depends on it.
     fn io_read(&self, offset: u32, _width: u8) -> u32 {
-        // Diagnostic tap (armed only by the `disc` stall report): histogram which register is read.
-        if let Some(m) = self.io_trace.borrow_mut().as_mut() {
-            *m.entry(offset).or_insert(0) += 1;
-        }
-        match offset {
+        let val = match offset {
             0x000..=0x05F => self.mem_control[(offset >> 2) as usize], // memory-control 1
             0x060 => self.mem_control[0x18], // RAM_SIZE
             0x070 => self.irq.read_stat() as u32, // I_STAT
@@ -433,7 +447,25 @@ impl Bus {
             0x814 => self.gpu.status(),  // GPUSTAT
             0xC00..=0xFFF => 0, // SPU (deferred, like the DMG APU)
             _ => 0,
+        };
+        // [TEMP M6] diagnostic tap (armed only by the `disc` stall report): record count + the reading
+        // instruction's PC + the value range, so the report can name what the poll loop reads and
+        // whether that value actually changes. Off by default → the gates are byte-for-byte unaffected.
+        if let Some(m) = self.io_trace.borrow_mut().as_mut() {
+            let e = m.entry(offset).or_default();
+            if e.count == 0 {
+                e.first_val = val;
+                e.min_val = val;
+                e.max_val = val;
+            } else {
+                e.min_val = e.min_val.min(val);
+                e.max_val = e.max_val.max(val);
+            }
+            e.count += 1;
+            e.last_pc = self.cur_pc.get();
+            e.last_val = val;
         }
+        val
     }
 
     fn io_write(&mut self, offset: u32, val: u32, _width: u8) {
