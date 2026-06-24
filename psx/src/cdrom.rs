@@ -156,6 +156,7 @@ impl Cdrom {
         self.mode
     }
 
+
     // ===== register reads (the `&self` path; FIFO pops go through interior mutability) ===========
     pub fn read(&self, offset: u32) -> u32 {
         match offset {
@@ -258,14 +259,30 @@ impl Cdrom {
         }
     }
 
-    /// The user-data window inside the 2352-byte sector, by Setmode bit 5. Default (0x800 mode) skips
-    /// 12 sync + 4 header + 8 subheader = 24 bytes and delivers 2048; whole-sector (0x924) skips only
-    /// the 12-byte sync and delivers 2340. Mixing the two corrupts every read.
+    /// The data window inside the 2352-byte raw sector that a `Request` (BFRD) loads into the data FIFO,
+    /// by Setmode bit 5 (sector size).
+    ///
+    /// **The 0Ch MODE2 read-offset (the gotcha that crashed real games).** By the book, 0x800 mode =
+    /// "data only" = the 2048-byte user area at raw offset 24 (skip 12 sync + 4 header + 8 subheader),
+    /// and 0x924 = "whole sector except the 12 sync bytes" = raw[12..] (header + subheader + data +
+    /// EDC/ECC, user data at FIFO offset 12). BUT Sony's **libcd** — which essentially every retail game
+    /// links, incl. Marvel vs Capcom *and* Silent Hill here — reads MODE2/Form1 *file* data using the
+    /// standard read **offset 0Ch** to skip the 12-byte MODE2 header+subheader (psx-spx lists 0Ch
+    /// explicitly), so it expects the **user data at the start** of the bytes it DMAs. We model the FIFO
+    /// *content* per the sector-size bit but not libcd's software read-offset, so we apply that 0Ch skip
+    /// here: in 0x924 mode deliver from the user data (raw 24), not from the header (raw 12). Delivering
+    /// raw[12..] put the "PS-X EXE" overlay 12 bytes late, so the BIOS `Exec()` launcher read the magic
+    /// (`"EXE "` = 0x45584520) as the entry point and jumped into garbage — the exact crash both games
+    /// hit. (The sector-size bit still matters: 0x924 hands over the trailing EDC/ECC that 0x800 omits.)
+    ///
+    /// Not modelled: a genuine *raw* whole-sector read (offset 00h — for the MODE2 subheader / CD-DA /
+    /// copy-protection). No data game needs it; revisit when XA audio / FMV (the SPU/MDEC milestone)
+    /// lands, since XA reads the subheader.
     fn sector_data_range(&self) -> (usize, usize) {
         if self.mode & 0x20 != 0 {
-            (12, 2340)
+            (24, 2328) // user data + EDC + ECC (raw 24..2352), MODE2 header/subheader skipped
         } else {
-            (24, 2048)
+            (24, 2048) // user data only
         }
     }
 
