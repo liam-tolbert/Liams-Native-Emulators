@@ -1698,6 +1698,61 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "gte LWC2/SWC2 via RAM", cpu.regs[3], 0x1234_5678);
     }
 
+    // --- GTE (COP2) commands (M6.1): the geometry core ---------------------------------
+    // RTPS/RTPT + the fixed-point pipeline are validated by the ps1-tests gte/test-all ROM (200 checks
+    // pass). These pin the other geometry-core commands (NCLIP, AVSZ, OP, MVMVA) with hand-computable
+    // inputs, because test-all breaks on the first un-implemented command (the colour family, M6.2)
+    // before reaching them. A GTE command is a COP2 op (opcode 0x12) with the "CO" bit (25) set.
+    {
+        let gte_run = |prog: &[u32]| -> Cpu {
+            let mut cpu = build(prog);
+            cpu.cop0.sr |= 1 << 30; // SR.CU2 = "GTE usable"
+            run(&mut cpu, prog.len());
+            cpu
+        };
+
+        // NCLIP: MAC0 = the signed area of the three screen points. SXY0=(1,0), SXY1=(0,1), SXY2=(0,0)
+        // -> SX0*SY1 + ... = 1*1 = 1.
+        let cpu = gte_run(&[
+            ori(1, 0, 1), mtc2(1, 12), // SXY0 = (sx=1, sy=0)
+            lui(1, 1), mtc2(1, 13), // SXY1 = (sx=0, sy=1)
+            ori(1, 0, 0), mtc2(1, 14), // SXY2 = (0, 0)
+            0x4A00_0006, // NCLIP
+            mfc2(2, 24), NOP, // r2 <- MAC0
+        ]);
+        check(&mut pass, "gte NCLIP signed area", cpu.regs[2], 1);
+
+        // AVSZ3: OTZ = ZSF3*(SZ1+SZ2+SZ3) >> 12. ZSF3=0x1000, SZ1=SZ2=SZ3=0x100 -> 0x1000*0x300>>12.
+        let cpu = gte_run(&[
+            ori(1, 0, 0x100), mtc2(1, 17), mtc2(1, 18), mtc2(1, 19), // SZ1=SZ2=SZ3=0x100
+            ori(1, 0, 0x1000), ctc2(1, 29), // ZSF3 = 0x1000
+            0x4A00_002D, // AVSZ3
+            mfc2(2, 7), NOP, // r2 <- OTZ
+        ]);
+        check(&mut pass, "gte AVSZ3 average Z", cpu.regs[2], 0x300);
+
+        // OP: cross product of the rotation diagonal [R11,R22,R33] with IR. R*=0x1000, IR=(1,2,3):
+        // MAC1 = R22*IR3 - R33*IR2 = 0x1000*3 - 0x1000*2 = 0x1000.
+        let cpu = gte_run(&[
+            ori(1, 0, 0x1000), ctc2(1, 0), ctc2(1, 2), ctc2(1, 4), // R11=R22=R33=0x1000
+            ori(1, 0, 1), mtc2(1, 9), ori(1, 0, 2), mtc2(1, 10), ori(1, 0, 3), mtc2(1, 11), // IR=1,2,3
+            0x4A00_000C, // OP (sf=0)
+            mfc2(2, 25), NOP, // r2 <- MAC1
+        ]);
+        check(&mut pass, "gte OP cross product", cpu.regs[2], 0x1000);
+
+        // MVMVA: rotation = identity (R11=R22=R33=0x1000), V0=(5,6,7), cv=none, sf=1:
+        // IR1 = (R11*VX0) >> 12 = (0x1000*5) >> 12 = 5.
+        let cpu = gte_run(&[
+            ori(1, 0, 0x1000), ctc2(1, 0), ctc2(1, 2), ctc2(1, 4), // identity rotation
+            lui(2, 0x0006), ori(2, 2, 0x0005), mtc2(2, 0), // VXY0 = (VX0=5, VY0=6)
+            ori(2, 0, 7), mtc2(2, 1), // VZ0 = 7
+            0x4A08_6012, // MVMVA (sf=1, mx=0=rot, v=0=V0, cv=3=none)
+            mfc2(3, 9), NOP, // r3 <- IR1
+        ]);
+        check(&mut pass, "gte MVMVA identity*V0", cpu.regs[3], 5);
+    }
+
     println!(
         "\n[CPU self-test] {}",
         if pass { "ALL PASSED" } else { "FAILURES ABOVE" }
