@@ -31,6 +31,7 @@ mod cpu;
 mod dma;
 mod exe;
 mod gpu;
+mod gte;
 mod img;
 mod irq;
 mod iso;
@@ -1127,16 +1128,19 @@ fn run_until_stall(cpu: &mut Cpu) -> StallReport {
             };
         }
 
-        // STOP 2: an un-emulated GTE/COP2 op — the real next wall; caught before it runs so we name it.
+        // STOP 2: an un-emulated GTE *command*. The register moves (MFC2/CFC2/MTC2/CTC2) and LWC2/SWC2
+        // are emulated as of M6.0, so they run through; only the geometry *command* words (the "CO" bit,
+        // 25, set — RTPS/NCLIP/...) are still stubbed, so we catch the first one and name the next GTE
+        // sub-stage. Caught before it runs, so the report points exactly at the opcode that needs M6.1+.
         let instr = cpu.bus.read32(pc);
-        let gte = match instr >> 26 {
-            0x12 => Some("un-emulated COP2/GTE instruction — selects the GTE (COP2) milestone"),
-            0x32 => Some("un-emulated LWC2 (GTE load) — selects the GTE (COP2) milestone"),
-            0x3A => Some("un-emulated SWC2 (GTE store) — selects the GTE (COP2) milestone"),
-            _ => None,
-        };
-        if let Some(reason) = gte {
-            return StallReport { pc, instr, reason: reason.into(), steps: i, poll: None };
+        if instr >> 26 == 0x12 && instr & (1 << 25) != 0 {
+            return StallReport {
+                pc,
+                instr,
+                reason: "un-emulated GTE (COP2) command — selects the next GTE sub-stage".into(),
+                steps: i,
+                poll: None,
+            };
         }
 
         // Liveness: new RAM code, fresh TTY, OR an interrupt taken since the last step all count as

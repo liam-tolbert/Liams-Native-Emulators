@@ -23,6 +23,7 @@
 
 use crate::bus::Bus;
 use crate::cop0::{Cop0, Exception};
+use crate::gte::Gte;
 
 pub struct Cpu {
     /// General-purpose registers as seen by the *currently executing* instruction (the read
@@ -62,6 +63,7 @@ pub struct Cpu {
     cycles: u32,
 
     pub cop0: Cop0, // COP0 is part of the CPU, so the CPU owns it (unlike the DMG's bus-owned IRQs)
+    pub gte: Gte,   // COP2 (the GTE) is likewise a CPU coprocessor — owned here alongside COP0
 
     /// When true, snoop BIOS `std_out_putchar` calls and copy the character into the captured TTY
     /// stream — the hook that lets the headless TTY harness read whatever a booting BIOS or a
@@ -96,6 +98,7 @@ impl Cpu {
             lo: 0,
             cycles: 0,
             cop0: Cop0::new(),
+            gte: Gte::new(),
             capture_tty: false,
             irq_taken: 0,
             bus,
@@ -632,22 +635,66 @@ impl Cpu {
             }
 
             // ---- the other coprocessors: COP1/COP2/COP3 and their load/store forms ----
-            // The PS1 has no COP1 (FPU) or COP3, and COP2 is the GTE (the geometry engine — arrives
-            // later). Whether one of these faults depends ONLY on the matching SR.CUn "usable" bit,
-            // not on whether we've implemented it: if software enabled the coprocessor the op is
-            // accepted (and, for now, does nothing); if not, it raises Coprocessor Unusable. The low
-            // nibble of the primary opcode is the coprocessor number — COPn = 0x10+n, LWCn = 0x30+n,
-            // SWCn = 0x38+n — so map each to its number and let `cop_op` apply the gate.
+            // The PS1 has no COP1 (FPU) or COP3, so those stay gated no-ops (`cop_op` faults only if
+            // software didn't enable them via SR.CUn). COP2 *is* the GTE and is now emulated: its moves
+            // and LWC2/SWC2 are decoded below; only the geometry command words are still stubbed (M6.0).
             0x11 => self.cop_op(1),
-            0x12 => self.cop_op(2),
+            0x12 => {
+                // COP2 — the GTE. Gated on SR.CU2 like the others. With the bit set we decode the op:
+                // the "CO" bit (25) marks a GTE *command* (RTPS/NCLIP/...); otherwise the rs field
+                // selects a register move, exactly as the COP0 0x10 arm decodes MFC0/MTC0.
+                if !self.cop0.cop_usable(2) {
+                    self.cop_unusable(2);
+                } else if instr & (1 << 25) != 0 {
+                    self.gte.command(instr); // a command word (M6.0: a no-op stub; the math arrives in M6.1+)
+                } else {
+                    match rs {
+                        // MFC2/CFC2 read the GTE into a GPR — load-delayed like MFC0 and the loads, so
+                        // the value parks in the load slot and becomes visible one instruction later.
+                        0x00 => self.load = (rt, self.gte.read_data(rd)), // MFC2 rt, data[rd]
+                        0x02 => self.load = (rt, self.gte.read_ctrl(rd)), // CFC2 rt, ctrl[rd]
+                        0x04 => self.gte.write_data(rd, self.reg(rt)),    // MTC2 data[rd], rt
+                        0x06 => self.gte.write_ctrl(rd, self.reg(rt)),    // CTC2 ctrl[rd], rt
+                        _ => {} // other COP2 move forms (BC2 ...) are unused on the PS1 — NOP, not a fault
+                    }
+                }
+            }
             0x13 => self.cop_op(3),
             0x30 => self.cop_op(0), // LWC0
             0x31 => self.cop_op(1), // LWC1
-            0x32 => self.cop_op(2), // LWC2 (GTE)
+            0x32 => {
+                // LWC2 — load a word from memory straight into GTE data register rt (word-aligned).
+                // Gated on CU2; unlike a COP0 move it gets no kernel-mode exemption (see `cop_op`).
+                if !self.cop0.cop_usable(2) {
+                    self.cop_unusable(2);
+                } else {
+                    let addr = self.reg(rs).wrapping_add(imm_se);
+                    if addr & 3 != 0 {
+                        self.cop0.bad_vaddr = addr;
+                        self.exception(Exception::AddrErrLoad);
+                    } else {
+                        let v = self.bus.read32(addr);
+                        self.gte.write_data(rt, v);
+                    }
+                }
+            }
             0x33 => self.cop_op(3), // LWC3
             0x38 => self.cop_op(0), // SWC0
             0x39 => self.cop_op(1), // SWC1
-            0x3A => self.cop_op(2), // SWC2 (GTE)
+            0x3A => {
+                // SWC2 — store GTE data register rt to memory (word-aligned). Gated on CU2.
+                if !self.cop0.cop_usable(2) {
+                    self.cop_unusable(2);
+                } else {
+                    let addr = self.reg(rs).wrapping_add(imm_se);
+                    if addr & 3 != 0 {
+                        self.cop0.bad_vaddr = addr;
+                        self.exception(Exception::AddrErrStore);
+                    } else {
+                        self.store32(addr, self.gte.read_data(rt));
+                    }
+                }
+            }
             0x3B => self.cop_op(3), // SWC3
 
             _ => self.exception(Exception::ReservedInstr), // unknown primary opcode

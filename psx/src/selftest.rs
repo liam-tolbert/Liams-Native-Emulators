@@ -1592,6 +1592,112 @@ pub(crate) fn run_selftest() -> bool {
         check(&mut pass, "cd Pause stopped the stream", bus.read32(0x1F80_1803) & 7, 0);
     }
 
+    // --- GTE (COP2) register file + moves (M6.0) ---------------------------------------
+    // The GTE is a CPU coprocessor; its registers are reached via MTC2/MFC2 (data) and CTC2/CFC2
+    // (control), gated on SR.CU2. These pin the read/write *quirks* the ps1-tests gte/test-all ROM
+    // checks first — sign/zero-extension, the screen-XY FIFO, IRGB/ORGB, LZCS/LZCR, the H read-back
+    // bug, and the FLAG error-summary bit. (The geometry commands themselves arrive in M6.1+.) Each
+    // program ends in a NOP so a load-delayed MFC2/CFC2 result settles into the register file first.
+    {
+        // COP2 ops fault unless software enabled the coprocessor — set SR.CU2, then run the program.
+        let gte_run = |prog: &[u32]| -> Cpu {
+            let mut cpu = build(prog);
+            cpu.cop0.sr |= 1 << 30; // SR.CU2 = "GTE usable"
+            run(&mut cpu, prog.len());
+            cpu
+        };
+
+        // A plain 32-bit data register (MAC0, d24) round-trips verbatim.
+        let cpu = gte_run(&[lui(1, 0xDEAD), ori(1, 1, 0xBEEF), mtc2(1, 24), mfc2(2, 24), NOP]);
+        check(&mut pass, "gte MAC0 round-trip", cpu.regs[2], 0xDEAD_BEEF);
+
+        // IR1 (d9) is 16-bit signed: 0xFFFF reads back sign-extended.
+        let cpu = gte_run(&[ori(1, 0, 0xFFFF), mtc2(1, 9), mfc2(2, 9), NOP]);
+        check(&mut pass, "gte IR1 sign-extended", cpu.regs[2], 0xFFFF_FFFF);
+
+        // VZ0 (d1) is 16-bit signed; a positive value zero-fills the top half.
+        let cpu = gte_run(&[ori(1, 0, 0x1234), mtc2(1, 1), mfc2(2, 1), NOP]);
+        check(&mut pass, "gte VZ0 positive", cpu.regs[2], 0x0000_1234);
+
+        // OTZ (d7) is 16-bit UNSIGNED: 0xFFFF reads back zero-extended (not sign-extended).
+        let cpu = gte_run(&[ori(1, 0, 0xFFFF), mtc2(1, 7), mfc2(2, 7), NOP]);
+        check(&mut pass, "gte OTZ zero-extended", cpu.regs[2], 0x0000_FFFF);
+
+        // SZ3 (d19) is 16-bit unsigned; the high half of the written word is dropped on read.
+        let cpu = gte_run(&[lui(1, 0x1234), ori(1, 1, 0xFFFF), mtc2(1, 19), mfc2(2, 19), NOP]);
+        check(&mut pass, "gte SZ3 zero-extended", cpu.regs[2], 0x0000_FFFF);
+
+        // SXYP (d15): writing pushes the screen-XY FIFO (SXY0<-SXY1<-SXY2<-val); reading mirrors SXY2.
+        let cpu = gte_run(&[
+            ori(1, 0, 0x1111), mtc2(1, 12), // SXY0
+            ori(1, 0, 0x2222), mtc2(1, 13), // SXY1
+            ori(1, 0, 0x3333), mtc2(1, 14), // SXY2
+            ori(1, 0, 0x4444), mtc2(1, 15), // SXYP write -> push: SXY0=2222, SXY1=3333, SXY2=4444
+            mfc2(2, 15),                    // r2 <- SXYP (mirrors SXY2 == 4444)
+            mfc2(3, 12),                    // r3 <- SXY0 (== old SXY1 == 2222, proving the push)
+            NOP,
+        ]);
+        check(&mut pass, "gte SXYP mirrors SXY2", cpu.regs[2], 0x0000_4444);
+        check(&mut pass, "gte SXY FIFO pushed", cpu.regs[3], 0x0000_2222);
+
+        // IRGB (d28) write unpacks a 5:5:5 colour into IR1/IR2/IR3 (each field *0x80); ORGB (d29)
+        // re-packs them back to 5:5:5. Write 0x7FFF -> IR1=0xF80; read ORGB -> 0x7FFF.
+        let cpu = gte_run(&[ori(1, 0, 0x7FFF), mtc2(1, 28), mfc2(2, 9), mfc2(3, 29), NOP]);
+        check(&mut pass, "gte IRGB unpacks to IR1", cpu.regs[2], 0x0000_0F80);
+        check(&mut pass, "gte ORGB re-packs IR", cpu.regs[3], 0x0000_7FFF);
+
+        // ORGB (d29) is read-only: writing it must not disturb IR1.
+        let cpu = gte_run(&[
+            ori(1, 0, 0), mtc2(1, 9), // IR1 = 0
+            ori(1, 0, 0x7FFF), mtc2(1, 29), // write ORGB (ignored)
+            mfc2(2, 9), NOP, // IR1 still 0
+        ]);
+        check(&mut pass, "gte ORGB write ignored", cpu.regs[2], 0x0000_0000);
+
+        // LZCS/LZCR (d30/d31): LZCR = count of LZCS's leading sign bits. 0x00FFFFFF -> 8 leading zeros.
+        let cpu = gte_run(&[lui(1, 0x00FF), ori(1, 1, 0xFFFF), mtc2(1, 30), mfc2(2, 31), NOP]);
+        check(&mut pass, "gte LZCR leading zeros", cpu.regs[2], 8);
+
+        // LZCR for a negative LZCS counts leading ones instead: 0xFFF00000 -> 12.
+        let cpu = gte_run(&[lui(1, 0xFFF0), mtc2(1, 30), mfc2(2, 31), NOP]);
+        check(&mut pass, "gte LZCR leading ones", cpu.regs[2], 12);
+
+        // LZCS (d30) itself reads back raw (it's the input value, not the count).
+        let cpu = gte_run(&[lui(1, 0x00FF), ori(1, 1, 0xFFFF), mtc2(1, 30), mfc2(2, 30), NOP]);
+        check(&mut pass, "gte LZCS raw read", cpu.regs[2], 0x00FF_FFFF);
+
+        // A plain 32-bit control register (TRX, c5) round-trips via CTC2/CFC2.
+        let cpu = gte_run(&[lui(1, 0xCAFE), ori(1, 1, 0xF00D), ctc2(1, 5), cfc2(2, 5), NOP]);
+        check(&mut pass, "gte TRX round-trip", cpu.regs[2], 0xCAFE_F00D);
+
+        // R33 (c4) is a 16-bit signed matrix corner: 0x8000 reads back sign-extended.
+        let cpu = gte_run(&[ori(1, 0, 0x8000), ctc2(1, 4), cfc2(2, 4), NOP]);
+        check(&mut pass, "gte R33 sign-extended", cpu.regs[2], 0xFFFF_8000);
+
+        // H (c26): used as unsigned, but the hardware reads it back SIGN-extended (a checked quirk).
+        let cpu = gte_run(&[ori(1, 0, 0xFFFF), ctc2(1, 26), cfc2(2, 26), NOP]);
+        check(&mut pass, "gte H reads sign-extended", cpu.regs[2], 0xFFFF_FFFF);
+
+        // FLAG (c31): writing an error bit (24 = IR1 saturated) sets the bit-31 summary on read-back.
+        let cpu = gte_run(&[lui(1, 0x0100), ctc2(1, 31), cfc2(2, 31), NOP]);
+        check(&mut pass, "gte FLAG error sets bit31", cpu.regs[2], 0x8100_0000);
+
+        // FLAG bit-31 is NOT set by a non-summary bit (21 = colour-FIFO-R saturated).
+        let cpu = gte_run(&[lui(1, 0x0020), ctc2(1, 31), cfc2(2, 31), NOP]);
+        check(&mut pass, "gte FLAG non-summary bit", cpu.regs[2], 0x0020_0000);
+
+        // LWC2/SWC2 move a word between memory and a GTE data register; round-trip through RAM.
+        let cpu = gte_run(&[
+            ori(1, 0, 0x200), // r1 = scratch address
+            lui(2, 0x1234), ori(2, 2, 0x5678), // r2 = 0x12345678
+            sw(2, 1, 0), // mem[0x200] = r2
+            lwc2(24, 1, 0), // GTE d24 <- mem[0x200]
+            swc2(24, 1, 4), // mem[0x204] <- GTE d24
+            lw(3, 1, 4), NOP, // r3 <- mem[0x204]
+        ]);
+        check(&mut pass, "gte LWC2/SWC2 via RAM", cpu.regs[3], 0x1234_5678);
+    }
+
     println!(
         "\n[CPU self-test] {}",
         if pass { "ALL PASSED" } else { "FAILURES ABOVE" }
@@ -1666,4 +1772,27 @@ fn mfc0(rt: u32, rd: u32) -> u32 {
 }
 fn rfe() -> u32 {
     (0x10 << 26) | (0x10 << 21) | 0x10 // CO bit set (rs>=0x10) + funct 0x10 = RFE
+}
+
+// COP2 (the GTE) moves — primary opcode 0x12, `rs` selects the form (mirrors the `0x12 => match rs`
+// decode in cpu.rs); LWC2/SWC2 are their own primary opcodes. MFC2/CFC2 read the GTE into a GPR
+// load-delayed (like MFC0); MTC2/CTC2 write a GTE data/control register from a GPR. `rd` is the GTE
+// register, `rt` the GPR.
+fn mtc2(rt: u32, rd: u32) -> u32 {
+    (0x12 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11) // rs = 0x04 = MTC2 (data)
+}
+fn mfc2(rt: u32, rd: u32) -> u32 {
+    (0x12 << 26) | (rt << 16) | (rd << 11) // rs = 0x00 = MFC2 (data)
+}
+fn ctc2(rt: u32, rd: u32) -> u32 {
+    (0x12 << 26) | (0x06 << 21) | (rt << 16) | (rd << 11) // rs = 0x06 = CTC2 (control)
+}
+fn cfc2(rt: u32, rd: u32) -> u32 {
+    (0x12 << 26) | (0x02 << 21) | (rt << 16) | (rd << 11) // rs = 0x02 = CFC2 (control)
+}
+fn lwc2(rt: u32, rs: u32, imm: u32) -> u32 {
+    enc_i(0x32, rs, rt, imm) // load a word from mem -> GTE data register rt
+}
+fn swc2(rt: u32, rs: u32, imm: u32) -> u32 {
+    enc_i(0x3A, rs, rt, imm) // store GTE data register rt -> mem
 }
