@@ -1580,10 +1580,15 @@ pub(crate) fn run_selftest() -> bool {
         bus.write32(0x1F80_1800, 1);
         check(&mut pass, "cd Pause INT3", bus.read32(0x1F80_1803) & 7, 3);
         bus.write32(0x1F80_1803, 0x07); // ack
-        bus.tick(60_000);
-        check(&mut pass, "cd Pause INT2", bus.read32(0x1F80_1803) & 7, 2);
+        // A Pause issued *mid-read* doesn't complete one ack later — the drive has to finish the
+        // in-flight sector and wind the read engine down, so the INT2 arrives ~PAUSE_DONE (~1M cycles)
+        // after the ack, not ~50k. (ps1-tests cdrom/timing measures this completion at ~1.01M cycles.)
+        bus.tick(60_000); // < PAUSE_DONE
+        check(&mut pass, "cd Pause INT2 not yet", bus.read32(0x1F80_1803) & 7, 0);
+        bus.tick(1_100_000); // past PAUSE_DONE
+        check(&mut pass, "cd Pause INT2 complete", bus.read32(0x1F80_1803) & 7, 2);
         bus.write32(0x1F80_1803, 0x07); // ack
-        bus.tick(1_000_000); // longer than a sector period
+        bus.tick(1_000_000); // longer than a sector period — the stream stays stopped
         check(&mut pass, "cd Pause stopped the stream", bus.read32(0x1F80_1803) & 7, 0);
     }
 

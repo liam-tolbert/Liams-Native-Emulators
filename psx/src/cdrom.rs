@@ -45,6 +45,15 @@ const ACK_DELAY: u32 = 50_000;
 const INIT_ACK: u32 = 75_000;
 const INIT_DONE: u32 = 475_000;
 const SEEK_DELAY: u32 = 1_000_000;
+/// Pause's *completion* (the INT2 after the INT3 ack) when issued **mid-read**. On hardware the drive
+/// can't park instantly: it finishes the sector under the head and lets the read engine settle, so the
+/// second response arrives a long time after the ack — *not* one ack-latency later. The ps1-tests
+/// `cdrom/timing` golden measures this at a near-constant ~1.01M (single speed) / ~1.04M (double) CPU
+/// cycles regardless of speed (so it's a fixed settle, not "one more sector period"); psx-spx likewise
+/// notes Pause's 2nd response is much later than its 1st. Pausing while *not* reading completes quickly
+/// (ACK_DELAY) — there's nothing to wind down. (Gotcha: our old code used ACK_DELAY for both, so a
+/// mid-read Pause completed ~20x too fast — a game that waits on the INT2 would resume far too early.)
+const PAUSE_DONE: u32 = 1_000_000;
 
 /// A raw CD sector is 2352 bytes (12 sync + 4 header + 2336 of subheader/data/ECC).
 const SECTOR_RAW_LEN: usize = 2352;
@@ -356,7 +365,10 @@ impl Cdrom {
             }
             0x09 | 0x08 => {
                 // Pause / Stop — halt streaming (and, for Stop, the motor). Aborting the queue drops
-                // any in-flight ReadN sector so the stream really stops.
+                // any in-flight ReadN sector so the stream really stops. The *completion* (INT2) timing
+                // depends on whether we were mid-read: a reading drive has to wind down (PAUSE_DONE),
+                // an idle one parks at once (ack) — see PAUSE_DONE for the cdrom/timing evidence.
+                let was_reading = self.reading;
                 self.reading = false;
                 self.status &= !ST_READ;
                 if cmd == 0x08 {
@@ -364,7 +376,7 @@ impl Cdrom {
                 }
                 self.abort_queue();
                 self.enqueue(3, vec![self.status], ack);
-                self.enqueue(2, vec![self.status], ack);
+                self.enqueue(2, vec![self.status], if was_reading { PAUSE_DONE } else { ack });
             }
             0x0B | 0x0C => self.enqueue(3, vec![self.status], ack), // Mute / Demute (no audio yet)
             0x15 | 0x16 => {
